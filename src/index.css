@@ -1,0 +1,92 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100dvh;
+  width: 100vw;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+  background-color: #0e0f12;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.control-surface,
+.control-surface * {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.pixelated {
+  image-rendering: -moz-crisp-edges;
+  image-rendering: -webkit-crisp-edges;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+
+.crt-scanlines {
+  background: linear-gradient(
+    to bottom,
+    rgba(255, 255, 255, 0) 50%,
+    rgba(0, 0, 0, 0.22) 50%
+  );
+  background-size: 100% 4px;
+}
+
+.sinclair-stripes {
+  background: linear-gradient(
+    115deg,
+    #d71b1b 0% 25%,
+    #d7c81b 25% 50%,
+    #1bd729 50% 75%,
+    #1bbbd7 75% 100%
+  );
+}
+
+@keyframes disk-led-blink {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.2;
+  }
+}
+
+.animate-disk-led-blink {
+  animation: disk-led-blink 0.2s steps(2, end) infinite;
+}
+
+@keyframes keycap-edit-pulse {
+  0%, 100% {
+    opacity: 0.22;
+  }
+  50% {
+    opacity: 0.95;
+  }
+}
+
+.animate-keycap-edit-pulse {
+  animation: keycap-edit-pulse 1.05s ease-in-out infinite;
+  will-change: opacity;
+}
+
+.zx-text-shadow {
+  text-shadow: 0 1px 1px rgba(0, 0, 0, 0.9);
+}
+
+.zx-fire-shadow {
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.85);
+}

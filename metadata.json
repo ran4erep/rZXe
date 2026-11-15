@@ -1,0 +1,8 @@
+{
+  "name": "ZX Spectrum 48K",
+  "description": "Эмулятор ZX Spectrum 48K с оригинальным ПЗУ Sinclair 1982 года, загрузкой TAP/SNA/Z80, звуком бипера и адаптивной сенсорной клавиатурой.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
