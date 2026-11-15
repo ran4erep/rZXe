@@ -178,7 +178,13 @@ test('smart fetchers fall back cleanly from static-host HTML/404 to direct zxart
         );
       }
 
-      // First external proxy rate-limits (429), second returns valid ZIP binary
+      // First two external proxies fail (403 limit / 429), third returns valid ZIP binary
+      if (url.startsWith('https://proxy.corsfix.com/')) {
+        return new Response('{"corsfix_error":"free_tier_transfer_limit"}', {
+          status: 403,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
       if (url.startsWith('https://api.cors.lol/')) {
         return new Response('Rate limit exceeded', { status: 429 });
       }
@@ -208,9 +214,15 @@ test('smart fetchers fall back cleanly from static-host HTML/404 to direct zxart
     const bytes = await downloadZxArtFileSmart('https://zxart.ee/releasefile/id:98874/Exolon.tzx.zip');
     assert.deepEqual(bytes, new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0xaa, 0xbb]));
 
-    // Next download should immediately start with the remembered working proxy (index 1: codetabs)
+    // Repeated download of the same URL is served from memory with zero network calls
+    const callsBeforeCached = calls.length;
+    const cachedBytes = await downloadZxArtFileSmart('https://zxart.ee/releasefile/id:98874/Exolon.tzx.zip');
+    assert.deepEqual(cachedBytes, bytes);
+    assert.equal(calls.length, callsBeforeCached);
+
+    // Different URL should immediately start with the remembered working proxy (codetabs)
     const callsBeforeSecondDownload = calls.length;
-    await downloadZxArtFileSmart('https://zxart.ee/releasefile/id:98874/Exolon.tzx.zip');
+    await downloadZxArtFileSmart('https://zxart.ee/releasefile/id:98875/Exolon.tap.zip');
     assert.ok(calls[callsBeforeSecondDownload].startsWith('https://api.codetabs.com/'));
   } finally {
     globalThis.fetch = prevFetch;

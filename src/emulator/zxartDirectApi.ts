@@ -41,6 +41,11 @@ export interface ExternalCorsProxySpec {
  */
 export const EXTERNAL_CORS_PROXIES: readonly ExternalCorsProxySpec[] = [
   {
+    id: 'corsfix-sdk',
+    label: 'proxy.corsfix.com',
+    buildUrl: (targetUrl) => `https://proxy.corsfix.com/?sdk=1&url=${encodeURIComponent(targetUrl)}`,
+  },
+  {
     id: 'cors-lol',
     label: 'api.cors.lol',
     buildUrl: (targetUrl) => `https://api.cors.lol/?url=${encodeURIComponent(targetUrl)}`,
@@ -277,6 +282,9 @@ type LocalProxyStatus = 'unknown' | 'available' | 'unavailable';
 
 let localProxyStatus: LocalProxyStatus = 'unknown';
 let preferredExternalProxyIndex = 0;
+const DOWNLOADED_FILE_CACHE = new Map<string, Uint8Array>();
+const MAX_CACHED_DOWNLOAD_ENTRIES = 8;
+const MAX_CACHED_DOWNLOAD_ITEM_BYTES = 2 * 1024 * 1024;
 
 export function getLocalProxyStatus(): LocalProxyStatus {
   return localProxyStatus;
@@ -285,6 +293,7 @@ export function getLocalProxyStatus(): LocalProxyStatus {
 export function resetProxyDiscoveryForTests(): void {
   localProxyStatus = 'unknown';
   preferredExternalProxyIndex = 0;
+  DOWNLOADED_FILE_CACHE.clear();
 }
 
 function combineAbortSignals(
@@ -554,7 +563,18 @@ export async function fetchZxArtReleasesSmart(
 }
 
 const MAX_EXTERNAL_FILE_BYTES = 25 * 1024 * 1024;
-const EXTERNAL_PROXY_TIMEOUT_MS = 6_500;
+const EXTERNAL_PROXY_TIMEOUT_MS = 8_500;
+
+function cacheDownloadedFile(fileUrl: string, bytes: Uint8Array): void {
+  if (bytes.byteLength === 0 || bytes.byteLength > MAX_CACHED_DOWNLOAD_ITEM_BYTES) return;
+  if (DOWNLOADED_FILE_CACHE.has(fileUrl)) {
+    DOWNLOADED_FILE_CACHE.delete(fileUrl);
+  } else if (DOWNLOADED_FILE_CACHE.size >= MAX_CACHED_DOWNLOAD_ENTRIES) {
+    const oldest = DOWNLOADED_FILE_CACHE.keys().next().value;
+    if (oldest !== undefined) DOWNLOADED_FILE_CACHE.delete(oldest);
+  }
+  DOWNLOADED_FILE_CACHE.set(fileUrl, bytes);
+}
 
 export async function downloadZxArtFileSmart(
   fileUrl: string,
@@ -562,6 +582,14 @@ export async function downloadZxArtFileSmart(
 ): Promise<Uint8Array> {
   if (!isAllowedZxArtDownloadUrl(fileUrl)) {
     throw new Error('Недопустимый URL файла ZX-Art');
+  }
+
+  const cached = DOWNLOADED_FILE_CACHE.get(fileUrl);
+  if (cached) {
+    // Refresh LRU order
+    DOWNLOADED_FILE_CACHE.delete(fileUrl);
+    DOWNLOADED_FILE_CACHE.set(fileUrl, cached);
+    return cached;
   }
 
   // 1. Prefer same-origin backend proxy when available (fast, no rate limits)
@@ -584,6 +612,7 @@ export async function downloadZxArtFileSmart(
         const buf = new Uint8Array(await localRes.arrayBuffer());
         if (!isHtmlOrJsonErrorPayload(buf, ct)) {
           localProxyStatus = 'available';
+          cacheDownloadedFile(fileUrl, buf);
           return buf;
         }
         localProxyStatus = 'unavailable';
@@ -628,6 +657,7 @@ export async function downloadZxArtFileSmart(
       }
 
       preferredExternalProxyIndex = candidate.index;
+      cacheDownloadedFile(fileUrl, buf);
       return buf;
     } catch (err) {
       if (signal?.aborted) throw err;
