@@ -90,6 +90,49 @@ for (const row of SPECTRUM_KEYS) {
   }
 }
 
+export type KeyboardLayout = 'en' | 'ru';
+
+// Soviet ZX Spectrum clones (Дельта-С, Ленинград, Пентагон, Компаньон, Символ, etc.)
+// used the exact same 8x5 #FE matrix with Russian ЙЦУКЕН letters mapped onto the 26 A-Z keys.
+export const SPECTRUM_RU_JCUKEN_MAP: Readonly<Record<string, string>> = {
+  Q: 'Й',
+  W: 'Ц',
+  E: 'У',
+  R: 'К',
+  T: 'Е',
+  Y: 'Н',
+  U: 'Г',
+  I: 'Ш',
+  O: 'Щ',
+  P: 'З',
+  A: 'Ф',
+  S: 'Ы',
+  D: 'В',
+  F: 'А',
+  G: 'П',
+  H: 'Р',
+  J: 'О',
+  K: 'Л',
+  L: 'Д',
+  Z: 'Я',
+  X: 'Ч',
+  C: 'С',
+  V: 'М',
+  B: 'И',
+  N: 'Т',
+  M: 'Ь',
+};
+
+export function getSpectrumKeyDisplayLabel(
+  spec: SpectrumKeySpec,
+  layout: KeyboardLayout
+): string {
+  if (layout === 'ru') {
+    return SPECTRUM_RU_JCUKEN_MAP[spec.id] ?? spec.label;
+  }
+  return spec.label;
+}
+
 const MIN_VIRTUAL_HOLD_FRAMES = 3;
 const QAOP_DIRECTION_KEYS = ['P', 'O', 'A', 'Q'] as const;
 
@@ -139,8 +182,11 @@ export class KeyboardMatrix {
   private readonly mouseBtnHoldFrames = new Uint8Array(3);
   private mouseBtnPendingMask = 0;
 
-  // Physical KeyboardEvent.code -> static tuple of matrix IDs pressed by that physical key
-  private readonly physicalPressed = new Map<string, readonly string[]>();
+  // Physical KeyboardEvent.code -> static physical key entry
+  private readonly physicalPressed = new Map<string, PhysicalKeyMapping>();
+  private physicalShiftCount = 0;
+  private physicalPunctSuppressCount = 0;
+  private appliedShiftCaps = false;
   // Touch / virtual pressed keys + minimum frame latch so fast taps never drop in 50Hz/25Hz loops
   private readonly virtualPressed = new Set<string>();
   private readonly virtualPendingRelease = new Set<string>();
@@ -155,10 +201,21 @@ export class KeyboardMatrix {
     this.kempston = (this.virtualKempstonMask | this.hardwareGamepadMask) & 0x1f;
   }
 
+  private syncPhysicalShiftCaps(): void {
+    const shouldApply = this.physicalShiftCount > 0 && this.physicalPunctSuppressCount === 0;
+    if (shouldApply !== this.appliedShiftCaps) {
+      this.appliedShiftCaps = shouldApply;
+      this.setKeyDelta('CAPS', shouldApply ? 1 : -1);
+    }
+  }
+
   public clearAll(): void {
     this.rows.fill(0x1f);
     this.counts.fill(0);
     this.physicalPressed.clear();
+    this.physicalShiftCount = 0;
+    this.physicalPunctSuppressCount = 0;
+    this.appliedShiftCaps = false;
     this.virtualPressed.clear();
     this.virtualPendingRelease.clear();
     this.virtualHoldFrames.clear();
@@ -577,9 +634,18 @@ export class KeyboardMatrix {
     if (!mapped) return false;
 
     this.physicalPressed.set(code, mapped);
-    for (let i = 0; i < mapped.length; i++) {
-      this.setKeyDelta(mapped[i], 1);
+    if (mapped.isPcShift) {
+      this.physicalShiftCount++;
+    } else {
+      if (mapped.suppressShiftCaps) {
+        this.physicalPunctSuppressCount++;
+      }
+      const keys = mapped.keys;
+      for (let i = 0; i < keys.length; i++) {
+        this.setKeyDelta(keys[i], 1);
+      }
     }
+    this.syncPhysicalShiftCaps();
     return true;
   }
 
@@ -587,9 +653,18 @@ export class KeyboardMatrix {
     const mapped = this.physicalPressed.get(code);
     if (!mapped) return;
     this.physicalPressed.delete(code);
-    for (let i = 0; i < mapped.length; i++) {
-      this.setKeyDelta(mapped[i], -1);
+    if (mapped.isPcShift) {
+      if (this.physicalShiftCount > 0) this.physicalShiftCount--;
+    } else {
+      if (mapped.suppressShiftCaps && this.physicalPunctSuppressCount > 0) {
+        this.physicalPunctSuppressCount--;
+      }
+      const keys = mapped.keys;
+      for (let i = 0; i < keys.length; i++) {
+        this.setKeyDelta(keys[i], -1);
+      }
     }
+    this.syncPhysicalShiftCaps();
   }
 
   public releasePhysicalMouseButtons(): void {
@@ -602,11 +677,20 @@ export class KeyboardMatrix {
 
   public releaseAllPhysical(): void {
     for (const [, mapped] of this.physicalPressed) {
-      for (let i = 0; i < mapped.length; i++) {
-        this.setKeyDelta(mapped[i], -1);
+      if (!mapped.isPcShift) {
+        const keys = mapped.keys;
+        for (let i = 0; i < keys.length; i++) {
+          this.setKeyDelta(keys[i], -1);
+        }
       }
     }
     this.physicalPressed.clear();
+    this.physicalShiftCount = 0;
+    this.physicalPunctSuppressCount = 0;
+    if (this.appliedShiftCaps) {
+      this.appliedShiftCaps = false;
+      this.setKeyDelta('CAPS', -1);
+    }
     this.hardwareGamepadMask = 0;
     this.hardwareGamepadStickMask = 0;
     this.syncKempston();
@@ -623,20 +707,41 @@ export class KeyboardMatrix {
   }
 }
 
+interface PhysicalKeyMapping {
+  readonly keys: readonly string[];
+  readonly isPcShift?: boolean;
+  readonly suppressShiftCaps?: boolean;
+}
+
 const CODE_SINGLE_TUPLES = new Map<string, readonly string[]>();
 const CODE_CAPS_TUPLES = new Map<string, readonly string[]>();
+const CODE_SINGLE_MAPPINGS = new Map<string, PhysicalKeyMapping>();
+const CODE_CAPS_MAPPINGS = new Map<string, PhysicalKeyMapping>();
 
 for (let c = 65; c <= 90; c++) {
   const ch = String.fromCharCode(c);
   const code = `Key${ch}`;
-  CODE_SINGLE_TUPLES.set(code, [ch]);
-  CODE_CAPS_TUPLES.set(code, ['CAPS', ch]);
+  const singleTuple: readonly string[] = [ch];
+  const capsTuple: readonly string[] = ['CAPS', ch];
+  CODE_SINGLE_TUPLES.set(code, singleTuple);
+  CODE_CAPS_TUPLES.set(code, capsTuple);
+  CODE_SINGLE_MAPPINGS.set(code, { keys: singleTuple });
+  CODE_CAPS_MAPPINGS.set(code, { keys: capsTuple });
 }
 for (let d = 0; d <= 9; d++) {
   const ch = String(d);
   const code = `Digit${ch}`;
-  CODE_SINGLE_TUPLES.set(code, [ch]);
-  CODE_CAPS_TUPLES.set(code, ['CAPS', ch]);
+  const numpadCode = `Numpad${ch}`;
+  const singleTuple: readonly string[] = [ch];
+  const capsTuple: readonly string[] = ['CAPS', ch];
+  CODE_SINGLE_TUPLES.set(code, singleTuple);
+  CODE_CAPS_TUPLES.set(code, capsTuple);
+  const singleMap: PhysicalKeyMapping = { keys: singleTuple };
+  const capsMap: PhysicalKeyMapping = { keys: capsTuple };
+  CODE_SINGLE_MAPPINGS.set(code, singleMap);
+  CODE_CAPS_MAPPINGS.set(code, capsMap);
+  CODE_SINGLE_MAPPINGS.set(numpadCode, singleMap);
+  CODE_CAPS_MAPPINGS.set(numpadCode, capsMap);
 }
 
 const PUNCT_KEY_TUPLES = new Map<string, readonly string[]>([
@@ -665,6 +770,11 @@ const PUNCT_KEY_TUPLES = new Map<string, readonly string[]>([
   ['>', ['SYMBOL', 'T']],
 ]);
 
+const PUNCT_PHYSICAL_MAPPINGS = new Map<string, PhysicalKeyMapping>();
+for (const [ch, tuple] of PUNCT_KEY_TUPLES) {
+  PUNCT_PHYSICAL_MAPPINGS.set(ch, { keys: tuple, suppressShiftCaps: true });
+}
+
 const TUPLE_ENTER: readonly string[] = ['ENTER'];
 const TUPLE_SPACE: readonly string[] = ['SPACE'];
 const TUPLE_CAPS_SPACE: readonly string[] = ['CAPS', 'SPACE'];
@@ -682,56 +792,89 @@ const TUPLE_SEMICOLON: readonly string[] = ['SYMBOL', 'O'];
 const TUPLE_QUOTE: readonly string[] = ['SYMBOL', 'P'];
 const TUPLE_MINUS: readonly string[] = ['SYMBOL', 'J'];
 const TUPLE_EQUAL: readonly string[] = ['SYMBOL', 'L'];
+const TUPLE_PLUS: readonly string[] = ['SYMBOL', 'K'];
+const TUPLE_ASTERISK: readonly string[] = ['SYMBOL', 'B'];
 
-function mapPhysicalKey(code: string, key: string, shiftKey: boolean): readonly string[] | null {
-  // Handle shifted punctuation first if character matches
-  const punct = PUNCT_KEY_TUPLES.get(key);
+const MAP_ENTER: PhysicalKeyMapping = { keys: TUPLE_ENTER };
+const MAP_SPACE: PhysicalKeyMapping = { keys: TUPLE_SPACE };
+const MAP_CAPS_SPACE: PhysicalKeyMapping = { keys: TUPLE_CAPS_SPACE };
+const MAP_PC_SHIFT: PhysicalKeyMapping = { keys: TUPLE_CAPS, isPcShift: true };
+const MAP_SYMBOL: PhysicalKeyMapping = { keys: TUPLE_SYMBOL };
+const MAP_BACKSPACE: PhysicalKeyMapping = { keys: TUPLE_BACKSPACE };
+const MAP_ARROW_L: PhysicalKeyMapping = { keys: TUPLE_ARROW_L };
+const MAP_ARROW_D: PhysicalKeyMapping = { keys: TUPLE_ARROW_D };
+const MAP_ARROW_U: PhysicalKeyMapping = { keys: TUPLE_ARROW_U };
+const MAP_ARROW_R: PhysicalKeyMapping = { keys: TUPLE_ARROW_R };
+const MAP_COMMA: PhysicalKeyMapping = { keys: TUPLE_COMMA, suppressShiftCaps: true };
+const MAP_PERIOD: PhysicalKeyMapping = { keys: TUPLE_PERIOD, suppressShiftCaps: true };
+const MAP_SLASH: PhysicalKeyMapping = { keys: TUPLE_SLASH, suppressShiftCaps: true };
+const MAP_SEMICOLON: PhysicalKeyMapping = { keys: TUPLE_SEMICOLON, suppressShiftCaps: true };
+const MAP_QUOTE: PhysicalKeyMapping = { keys: TUPLE_QUOTE, suppressShiftCaps: true };
+const MAP_MINUS: PhysicalKeyMapping = { keys: TUPLE_MINUS, suppressShiftCaps: true };
+const MAP_EQUAL: PhysicalKeyMapping = { keys: TUPLE_EQUAL, suppressShiftCaps: true };
+const MAP_PLUS: PhysicalKeyMapping = { keys: TUPLE_PLUS, suppressShiftCaps: true };
+const MAP_ASTERISK: PhysicalKeyMapping = { keys: TUPLE_ASTERISK, suppressShiftCaps: true };
+
+function mapPhysicalKey(code: string, key: string, shiftKey: boolean): PhysicalKeyMapping | null {
+  // Check physical letter & digit codes first so Shift+1..0 ALWAYS produce authentic
+  // Spectrum CAPS+1..0 (EDIT, CAPS LOCK, TRUE/INV VIDEO, arrows, GRAPHICS, DELETE)
+  // in both EN and RU OS keyboard layouts, while Ctrl/Alt + 1..0 produce SYMBOL+1..0 (!.._).
+  const codeMapping = shiftKey ? CODE_CAPS_MAPPINGS.get(code) : CODE_SINGLE_MAPPINGS.get(code);
+  if (codeMapping) return codeMapping;
+
+  // Handle shifted/unshifted non-digit punctuation cleanly (suppressing PC Shift's CAPS
+  // while active so characters like ", ?, :, +, <, >, _ send SYMBOL+key instead of CAPS+SYMBOL+key).
+  const punct = PUNCT_PHYSICAL_MAPPINGS.get(key);
   if (punct) return punct;
-
-  // Letter & digit keys by physical code (works even if OS layout is Russian!)
-  const codeTuple = shiftKey ? CODE_CAPS_TUPLES.get(code) : CODE_SINGLE_TUPLES.get(code);
-  if (codeTuple) return codeTuple;
 
   switch (code) {
     case 'Enter':
     case 'NumpadEnter':
-      return TUPLE_ENTER;
+      return MAP_ENTER;
     case 'Space':
-      return shiftKey ? TUPLE_CAPS_SPACE : TUPLE_SPACE;
+      return shiftKey ? MAP_CAPS_SPACE : MAP_SPACE;
     case 'ShiftLeft':
     case 'ShiftRight':
-      return TUPLE_CAPS;
+      return MAP_PC_SHIFT;
     case 'ControlLeft':
     case 'ControlRight':
     case 'AltLeft':
     case 'AltRight':
-      return TUPLE_SYMBOL;
+      return MAP_SYMBOL;
     case 'Backspace':
-      return TUPLE_BACKSPACE;
+    case 'Delete':
+      return MAP_BACKSPACE;
     case 'ArrowLeft':
-      return TUPLE_ARROW_L;
+      return MAP_ARROW_L;
     case 'ArrowDown':
-      return TUPLE_ARROW_D;
+      return MAP_ARROW_D;
     case 'ArrowUp':
-      return TUPLE_ARROW_U;
+      return MAP_ARROW_U;
     case 'ArrowRight':
-      return TUPLE_ARROW_R;
+      return MAP_ARROW_R;
     case 'Escape':
-      return TUPLE_CAPS_SPACE; // BREAK
+      return MAP_CAPS_SPACE; // BREAK
     case 'Comma':
-      return TUPLE_COMMA;
+      return MAP_COMMA;
     case 'Period':
-      return TUPLE_PERIOD;
+    case 'NumpadDecimal':
+      return MAP_PERIOD;
     case 'Slash':
-      return TUPLE_SLASH;
+    case 'NumpadDivide':
+      return MAP_SLASH;
     case 'Semicolon':
-      return TUPLE_SEMICOLON;
+      return MAP_SEMICOLON;
     case 'Quote':
-      return TUPLE_QUOTE;
+      return MAP_QUOTE;
     case 'Minus':
-      return TUPLE_MINUS;
+    case 'NumpadSubtract':
+      return MAP_MINUS;
     case 'Equal':
-      return TUPLE_EQUAL;
+      return MAP_EQUAL;
+    case 'NumpadAdd':
+      return MAP_PLUS;
+    case 'NumpadMultiply':
+      return MAP_ASTERISK;
     default:
       return null;
   }

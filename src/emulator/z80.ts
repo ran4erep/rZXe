@@ -89,6 +89,11 @@ export class Z80 {
   public screenBank: Uint8Array;
   public vramDirty = true;
 
+  // Beam-chase hook: active only during visible paper scanlines when rendering
+  public beamActiveStartT = 0x7fffffff;
+  public beamActiveEndT = 0;
+  public onScreenWrite: ((tstates: number) => void) | null = null;
+
   // Fast inline flags for ROM traps & TR-DOS M1 paging
   public trdosEnabled = false;
   public trdosActive = false;
@@ -168,10 +173,18 @@ export class Z80 {
     const bank = this.writeBanks[slot];
     if (bank !== null) {
       const off = a & 0x3fff;
-      bank[off] = val & 0xff;
-      if (off < 0x1b00 && bank === this.screenBank) {
+      const v = val & 0xff;
+      if (off < 0x1b00 && bank === this.screenBank && bank[off] !== v) {
         this.vramDirty = true;
+        if (
+          this.onScreenWrite !== null &&
+          this.tstates >= this.beamActiveStartT &&
+          this.tstates < this.beamActiveEndT
+        ) {
+          this.onScreenWrite(this.tstates);
+        }
       }
+      bank[off] = v;
     }
   }
 

@@ -1,8 +1,9 @@
 import { StereoMode } from './ay8910';
-import { JoystickMode } from './keyboard';
+import { JoystickMode, KeyboardLayout } from './keyboard';
 import { BorderMode } from './spectrum';
+import { GigascreenMode } from './videoBeam';
 
-export type { JoystickMode, BorderMode };
+export type { JoystickMode, KeyboardLayout, BorderMode, GigascreenMode };
 export type KeyboardMode = 'auto' | 'show' | 'hide';
 export type ScreenScaleMode = 'auto' | 'aspect' | 'stretch';
 
@@ -13,8 +14,10 @@ export interface EmulatorSettings {
   scanlines: boolean;
   borderMode: BorderMode;
   screenScale: ScreenScaleMode;
+  gigascreenMode: GigascreenMode;
   cpuFreqMhz: number;
   keyboardMode: KeyboardMode;
+  keyboardLayout: KeyboardLayout;
   joystickMode: JoystickMode;
   fastTapeLoad: boolean;
 }
@@ -26,8 +29,10 @@ export const DEFAULT_EMULATOR_SETTINGS: EmulatorSettings = {
   scanlines: false,
   borderMode: 'none',
   screenScale: 'auto',
+  gigascreenMode: 'auto',
   cpuFreqMhz: 3.5,
   keyboardMode: 'auto',
+  keyboardLayout: 'en',
   joystickMode: 'kempston',
   fastTapeLoad: true,
 };
@@ -81,6 +86,11 @@ export function sanitizeEmulatorSettings(raw: unknown): EmulatorSettings {
       ? obj.screenScale
       : DEFAULT_EMULATOR_SETTINGS.screenScale;
 
+  const gigascreenMode: GigascreenMode =
+    obj.gigascreenMode === 'auto' || obj.gigascreenMode === 'on' || obj.gigascreenMode === 'off'
+      ? obj.gigascreenMode
+      : DEFAULT_EMULATOR_SETTINGS.gigascreenMode;
+
   const cpuFreqMhz =
     typeof obj.cpuFreqMhz === 'number' && Number.isFinite(obj.cpuFreqMhz)
       ? Math.min(14, Math.max(0.5, Math.round(obj.cpuFreqMhz * 4) / 4))
@@ -90,6 +100,11 @@ export function sanitizeEmulatorSettings(raw: unknown): EmulatorSettings {
     obj.keyboardMode === 'auto' || obj.keyboardMode === 'show' || obj.keyboardMode === 'hide'
       ? obj.keyboardMode
       : DEFAULT_EMULATOR_SETTINGS.keyboardMode;
+
+  const keyboardLayout: KeyboardLayout =
+    obj.keyboardLayout === 'en' || obj.keyboardLayout === 'ru'
+      ? obj.keyboardLayout
+      : DEFAULT_EMULATOR_SETTINGS.keyboardLayout;
 
   const joystickMode: JoystickMode =
     obj.joystickMode === 'kempston' || obj.joystickMode === 'qaop'
@@ -108,8 +123,10 @@ export function sanitizeEmulatorSettings(raw: unknown): EmulatorSettings {
     scanlines,
     borderMode,
     screenScale,
+    gigascreenMode,
     cpuFreqMhz,
     keyboardMode,
+    keyboardLayout,
     joystickMode,
     fastTapeLoad,
   };

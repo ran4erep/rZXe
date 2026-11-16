@@ -6,9 +6,10 @@ import {
   JoystickMode,
   BorderMode,
   ScreenScaleMode,
+  GigascreenMode,
 } from '../emulator/settingsStorage';
 
-export type { EmulatorSettings, KeyboardMode, JoystickMode, BorderMode, ScreenScaleMode };
+export type { EmulatorSettings, KeyboardMode, JoystickMode, BorderMode, ScreenScaleMode, GigascreenMode };
 
 interface SettingsModalProps {
   open: boolean;
@@ -162,6 +163,12 @@ const SCALE_OPTIONS: readonly SelectOption<ScreenScaleMode>[] = [
   { value: 'auto', label: 'Авто' },
   { value: 'aspect', label: 'Пропорционально' },
   { value: 'stretch', label: 'Растянуть' },
+];
+
+const GIGASCREEN_OPTIONS: readonly SelectOption<GigascreenMode>[] = [
+  { value: 'auto', label: 'Авто' },
+  { value: 'on', label: 'Включено' },
+  { value: 'off', label: 'Выключено' },
 ];
 
 interface CategorySectionProps {
@@ -380,6 +387,12 @@ const SettingsModalContent: React.FC<SettingsModalContentProps> = ({
               value={settings.screenScale}
               options={SCALE_OPTIONS}
               onSelect={(screenScale) => onChange({ screenScale })}
+            />
+            <SettingSelect
+              label="Gigascreen"
+              value={settings.gigascreenMode}
+              options={GIGASCREEN_OPTIONS}
+              onSelect={(gigascreenMode) => onChange({ gigascreenMode })}
             />
             <CustomCheckboxRow
               label="Эффект ЭЛТ (Scanlines)"

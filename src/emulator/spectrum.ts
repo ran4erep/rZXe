@@ -29,6 +29,16 @@ import {
 } from './formats';
 import { ParsedTapeImage, parseTapeImage, wrapCodeBytesAsTap } from './tapeFormats';
 import { isHobetaExtension, parseDiskOrMediaImage } from './diskFormats';
+import {
+  GigascreenMode,
+  blendFrames5050,
+  computeActiveFrameHash,
+  renderBeamSpan,
+  renderStaticFrame,
+  tstatesToBeamPos,
+} from './videoBeam';
+
+export type { GigascreenMode };
 
 export const SCREEN_WIDTH = 320;
 export const SCREEN_HEIGHT = 240;
@@ -78,36 +88,6 @@ export function getBorderViewport(mode: BorderMode): BorderViewport {
   return VIEWPORT_FULL;
 }
 
-// Authentic ZX Spectrum 16-color palette in little-endian ABGR (0xAABBGGRR) for Uint32Array ImageData
-const PALETTE_ABGR = new Uint32Array([
-  0xff000000, // 0 Black
-  0xffd70000, // 1 Blue
-  0xff0000d7, // 2 Red
-  0xffd700d7, // 3 Magenta
-  0xff00d700, // 4 Green
-  0xffd7d700, // 5 Cyan
-  0xff00d7d7, // 6 Yellow
-  0xffd7d7d7, // 7 White
-  0xff000000, // 8 Bright Black
-  0xffff0000, // 9 Bright Blue
-  0xff0000ff, // 10 Bright Red
-  0xffff00ff, // 11 Bright Magenta
-  0xff00ff00, // 12 Bright Green
-  0xffffff00, // 13 Bright Cyan
-  0xff00ffff, // 14 Bright Yellow
-  0xffffffff, // 15 Bright White
-]);
-
-// Precomputed screen pixel row -> 16KB bank offset (0x0000..0x17FF)
-const Y_TO_PIXEL_OFF = new Uint16Array(192);
-const Y_TO_ATTR_OFF = new Uint16Array(192);
-for (let y = 0; y < 192; y++) {
-  const high = ((y & 0xc0) >> 3) | (y & 0x07);
-  const low = (y & 0x38) << 2;
-  Y_TO_PIXEL_OFF[y] = (high << 8) | low;
-  Y_TO_ATTR_OFF[y] = 0x1800 + ((y >> 3) << 5);
-}
-
 export class ZXSpectrum48 implements Z80IO {
   // Up to 16 x 16KB RAM pages (256 KB for Scorpion ZS 256)
   public readonly ramPages: Uint8Array[] = Array.from({ length: 16 }, () => new Uint8Array(16384));
@@ -135,15 +115,44 @@ export class ZXSpectrum48 implements Z80IO {
   public pagingLocked = false;
   public trdosActive = false;
 
-  // 320x240 RGBA buffer
+  // 320x240 RGBA output buffer & ping-pong raw buffers for zero-copy Gigascreen blending
   public readonly frameBuffer = new Uint32Array(SCREEN_WIDTH * SCREEN_HEIGHT);
+  private readonly bufA = new Uint32Array(SCREEN_WIDTH * SCREEN_HEIGHT);
+  private readonly bufB = new Uint32Array(SCREEN_WIDTH * SCREEN_HEIGHT);
+  private currRaw: Uint32Array = this.bufA;
+  private prevRaw: Uint32Array = this.bufB;
+  private currTargetIsA = true;
+  private paintedBorderOut = -1;
+  private paintedBorderA = -1;
+  private paintedBorderB = -1;
+  private hasPrevRaw = false;
+  private outputIsBlended = false;
+  public hasRenderedFrame = false;
+  public gigascreenMode: GigascreenMode = 'auto';
+
+  // Auto-Gigascreen detection state (Bank 5/7 toggle + 256-sample frame hash alternation)
+  private prevScreenEndBank = 5;
+  private bankFlipStreak = 0;
+  private hash1 = 0;
+  private hash2 = 0;
+  private hasHash1 = false;
+  private hasHash2 = false;
+  private hashFlipStreak = 0;
+  private autoBlendHold = 0;
+
+  // Lazy ULA beam-chase state (0% overhead when frames have no mid-frame visible writes)
+  private beamRenderEnabled = false;
+  private beamActive = false;
+  private beamPos = 0;
+  private beamVisibleStartT = 0;
+  private beamVisibleEndT = 0;
+  private beamActiveStartUlaT = 0;
+  private beamActiveEndUlaT = 0;
+  private prevFrameUsedBeam = false;
+  private beamTargetBuf: Uint32Array = this.frameBuffer;
 
   public borderColor = 7;
   public borderDirty = true;
-  private paintedBorderColor = -1;
-  private paintedWasScanline = true;
-  private readonly borderLines = new Uint8Array(SCREEN_HEIGHT);
-  private lastBorderLine = 0;
   public frameCount = 0;
   private flashPhase = false;
 
@@ -201,6 +210,7 @@ export class ZXSpectrum48 implements Z80IO {
       this.ramPages[0],
     ];
     this.cpu = new Z80(this.readBanks, this.writeBanks, this.ramPages[5], this);
+    this.cpu.onScreenWrite = this.onBeamScreenWrite;
     this.setMachine(initialMachine);
   }
 
@@ -244,10 +254,25 @@ export class ZXSpectrum48 implements Z80IO {
 
     this.borderColor = 7;
     this.borderDirty = true;
-    this.paintedBorderColor = -1;
-    this.paintedWasScanline = true;
-    this.lastBorderLine = 0;
-    this.borderLines.fill(7);
+    this.paintedBorderOut = -1;
+    this.paintedBorderA = -1;
+    this.paintedBorderB = -1;
+    this.hasPrevRaw = false;
+    this.outputIsBlended = false;
+    this.prevFrameUsedBeam = false;
+    this.beamRenderEnabled = false;
+    this.beamActive = false;
+    this.beamPos = 0;
+    this.cpu.beamActiveStartT = 0x7fffffff;
+    this.cpu.beamActiveEndT = 0;
+    this.prevScreenEndBank = 5;
+    this.bankFlipStreak = 0;
+    this.hash1 = 0;
+    this.hash2 = 0;
+    this.hasHash1 = false;
+    this.hasHash2 = false;
+    this.hashFlipStreak = 0;
+    this.autoBlendHold = 0;
     this.frameCount = 0;
     this.flashPhase = false;
     this.beeperLevel = 0;
@@ -312,6 +337,38 @@ export class ZXSpectrum48 implements Z80IO {
       this.tapePlayer.stop();
     }
     this.updateMemoryBanks();
+  }
+
+  public setGigascreenMode(mode: GigascreenMode): void {
+    if (this.gigascreenMode === mode) return;
+    const prevMode = this.gigascreenMode;
+    this.gigascreenMode = mode;
+
+    if (prevMode === 'off') {
+      if (this.hasRenderedFrame) {
+        this.currRaw.set(this.frameBuffer);
+      }
+      this.hasPrevRaw = false;
+      this.outputIsBlended = false;
+      this.paintedBorderA = -1;
+      this.paintedBorderB = -1;
+      this.bankFlipStreak = 0;
+      this.hashFlipStreak = 0;
+      this.autoBlendHold = 0;
+      this.hasHash1 = false;
+      this.hasHash2 = false;
+    } else if (mode === 'off') {
+      if (this.outputIsBlended && this.hasRenderedFrame) {
+        this.frameBuffer.set(this.currRaw);
+      }
+      this.outputIsBlended = false;
+      this.hasPrevRaw = false;
+      this.paintedBorderOut = -1;
+    } else {
+      this.bankFlipStreak = 0;
+      this.hashFlipStreak = 0;
+      this.autoBlendHold = 0;
+    }
   }
 
   public mountDisk(driveIdx: 0 | 1, filename: string, bytes: Uint8Array): void {
@@ -404,8 +461,9 @@ export class ZXSpectrum48 implements Z80IO {
   private finishSnapshotLoad(border: number): void {
     this.borderColor = border & 0x07;
     this.borderDirty = true;
-    this.paintedBorderColor = -1;
-    this.paintedWasScanline = true;
+    this.paintedBorderOut = -1;
+    this.paintedBorderA = -1;
+    this.paintedBorderB = -1;
     this.renderFrame();
   }
 
@@ -853,16 +911,16 @@ export class ZXSpectrum48 implements Z80IO {
     // ULA even port (A0 == 0)
     if ((port & 0x01) === 0) {
       const frameT = this.profile.tstatesPerFrame;
-      const cpuFrameT = this.currentCpuFrameT;
       const border = value & 0x07;
       if (border !== this.borderColor) {
-        const line = Math.max(
-          0,
-          Math.min(SCREEN_HEIGHT - 1, ((tstates * SCREEN_HEIGHT) / cpuFrameT) | 0)
-        );
-        if (line > this.lastBorderLine) {
-          this.borderLines.fill(this.borderColor, this.lastBorderLine, line);
-          this.lastBorderLine = line;
+        if (this.beamRenderEnabled) {
+          const beamT = this.mapToFrameT(tstates, frameT);
+          if (
+            beamT > this.beamVisibleStartT &&
+            (this.beamActive || beamT < this.beamVisibleEndT)
+          ) {
+            this.flushBeamTo(tstates);
+          }
         }
         this.borderColor = border;
         this.borderDirty = true;
@@ -907,6 +965,15 @@ export class ZXSpectrum48 implements Z80IO {
         this.ramPage3 = (value & 0x07) | pageHigh;
         const nextScreen = (value & 0x08) ? 7 : 5;
         if (nextScreen !== this.screenBankIdx) {
+          if (this.beamRenderEnabled) {
+            const beamT = this.mapToFrameT(tstates, this.profile.tstatesPerFrame);
+            if (
+              beamT > this.beamActiveStartUlaT &&
+              (this.beamActive || beamT < this.beamActiveEndUlaT)
+            ) {
+              this.flushBeamTo(tstates);
+            }
+          }
           this.screenBankIdx = nextScreen;
           this.cpu.vramDirty = true;
         }
@@ -1143,14 +1210,136 @@ export class ZXSpectrum48 implements Z80IO {
     // Keep dirty flags set so the next RAF tick paints the warped frame immediately
     this.cpu.vramDirty = true;
     this.borderDirty = true;
-    this.lastBorderLine = 0;
+  }
+
+  private readonly onBeamScreenWrite = (tstates: number): void => {
+    this.flushBeamTo(tstates);
+  };
+
+  private beginRawFrameTarget(): void {
+    if (this.gigascreenMode === 'off') {
+      this.beamTargetBuf = this.frameBuffer;
+      return;
+    }
+    this.currTargetIsA = !this.currTargetIsA;
+    this.currRaw = this.currTargetIsA ? this.bufA : this.bufB;
+    this.prevRaw = this.currTargetIsA ? this.bufB : this.bufA;
+    this.beamTargetBuf = this.currRaw;
+  }
+
+  private shouldPaintTargetBorder(borderIdx: number): boolean {
+    if (this.gigascreenMode === 'off') {
+      return this.paintedBorderOut !== borderIdx;
+    }
+    return (this.currTargetIsA ? this.paintedBorderA : this.paintedBorderB) !== borderIdx;
+  }
+
+  private markTargetBorderPainted(borderIdx: number): void {
+    if (this.gigascreenMode === 'off') {
+      this.paintedBorderOut = borderIdx;
+    } else if (this.currTargetIsA) {
+      this.paintedBorderA = borderIdx;
+    } else {
+      this.paintedBorderB = borderIdx;
+    }
+  }
+
+  private invalidateTargetBorderCache(): void {
+    if (this.gigascreenMode === 'off') {
+      this.paintedBorderOut = -1;
+    } else if (this.currTargetIsA) {
+      this.paintedBorderA = -1;
+    } else {
+      this.paintedBorderB = -1;
+    }
+  }
+
+  private flushBeamTo(cpuTstates: number): void {
+    if (!this.beamRenderEnabled) return;
+    const frameT = this.profile.tstatesPerFrame;
+    const beamT = this.mapToFrameT(cpuTstates, frameT);
+    const targetPos = tstatesToBeamPos(
+      beamT,
+      this.profile.firstActiveT,
+      this.profile.tstatesPerLine
+    );
+    if (!this.beamActive) {
+      if (targetPos <= 0) return;
+      this.beamActive = true;
+      this.beamPos = 0;
+      this.beginRawFrameTarget();
+    }
+    if (targetPos <= this.beamPos) return;
+    renderBeamSpan(
+      this.beamTargetBuf,
+      this.ramPages[this.screenBankIdx],
+      this.borderColor,
+      this.flashPhase,
+      this.beamPos,
+      targetPos
+    );
+    this.beamPos = targetPos;
+  }
+
+  private presentRenderedRawFrame(): void {
+    this.hasRenderedFrame = true;
+    if (this.gigascreenMode === 'off') {
+      this.outputIsBlended = false;
+      return;
+    }
+
+    let shouldBlend = false;
+    if (this.gigascreenMode === 'on') {
+      shouldBlend = this.hasPrevRaw;
+    } else {
+      if (this.hasPrevRaw && this.screenBankIdx !== this.prevScreenEndBank) {
+        this.bankFlipStreak++;
+      } else {
+        this.bankFlipStreak = 0;
+      }
+      this.prevScreenEndBank = this.screenBankIdx;
+
+      const h0 = computeActiveFrameHash(this.currRaw);
+      if (this.hasHash2 && h0 === this.hash2 && h0 !== this.hash1) {
+        this.hashFlipStreak++;
+      } else {
+        this.hashFlipStreak = 0;
+      }
+      this.hash2 = this.hash1;
+      this.hasHash2 = this.hasHash1;
+      this.hash1 = h0;
+      this.hasHash1 = true;
+
+      if (this.bankFlipStreak >= 2 || this.hashFlipStreak >= 2) {
+        this.autoBlendHold = 4;
+      } else if (this.autoBlendHold > 0) {
+        this.autoBlendHold--;
+      }
+
+      shouldBlend = this.hasPrevRaw && this.autoBlendHold > 0;
+    }
+
+    if (shouldBlend) {
+      blendFrames5050(this.currRaw, this.prevRaw, this.frameBuffer);
+      this.outputIsBlended = true;
+    } else {
+      this.frameBuffer.set(this.currRaw);
+      this.outputIsBlended = false;
+    }
+    this.hasPrevRaw = true;
   }
 
   public stepFrame(render = true): boolean {
     this.tickAutoLoader();
 
+    this.frameCount++;
+    let flashChanged = false;
+    if ((this.frameCount & 15) === 0) {
+      this.flashPhase = !this.flashPhase;
+      flashChanged = true;
+    }
+
     this.tapeCursorT = 0;
-    this.lastBorderLine = 0;
     if (this.profile.hasAY && this.soundEnabled) {
       this.ay.beginFrame();
     }
@@ -1167,9 +1356,36 @@ export class ZXSpectrum48 implements Z80IO {
     const cpuFrameT = Math.max(1000, Math.round(frameT * (this.cpuFreqMhz / 3.5)));
     this.currentCpuFrameT = cpuFrameT;
     this.ramEarPollCount = 0;
+
+    this.beamRenderEnabled = render;
+    this.beamActive = false;
+    this.beamPos = 0;
+    if (render) {
+      const tPerLine = this.profile.tstatesPerLine;
+      const firstActiveT = this.profile.firstActiveT;
+      this.beamVisibleStartT = firstActiveT - BORDER_Y * tPerLine - 16;
+      this.beamVisibleEndT = firstActiveT + (SCREEN_HEIGHT - BORDER_Y - 1) * tPerLine + 144;
+      this.beamActiveStartUlaT = firstActiveT;
+      this.beamActiveEndUlaT = firstActiveT + ACTIVE_HEIGHT * tPerLine;
+      if (cpuFrameT === frameT) {
+        this.cpu.beamActiveStartT = this.beamActiveStartUlaT;
+        this.cpu.beamActiveEndT = this.beamActiveEndUlaT;
+      } else {
+        this.cpu.beamActiveStartT = ((this.beamActiveStartUlaT * cpuFrameT) / frameT) | 0;
+        this.cpu.beamActiveEndT = ((this.beamActiveEndUlaT * cpuFrameT) / frameT) | 0;
+      }
+    } else {
+      this.cpu.beamActiveStartT = 0x7fffffff;
+      this.cpu.beamActiveEndT = 0;
+    }
+
     const tapeWasActive = this.tapePlayer.active;
     this.cpu.interrupt();
     this.cpu.runUntil(cpuFrameT);
+
+    this.cpu.beamActiveStartT = 0x7fffffff;
+    this.cpu.beamActiveEndT = 0;
+
     if (this.tapePlayer.active) {
       this.advanceTapeTo(frameT);
     }
@@ -1189,109 +1405,107 @@ export class ZXSpectrum48 implements Z80IO {
     this.cpu.tstates -= cpuFrameT;
     this.keyboard.endVirtualFrame();
 
-    if (this.lastBorderLine > 0) {
-      this.borderLines.fill(this.borderColor, this.lastBorderLine, SCREEN_HEIGHT);
-    }
-
-    this.frameCount++;
-    let flashChanged = false;
-    if ((this.frameCount & 15) === 0) {
-      this.flashPhase = !this.flashPhase;
-      flashChanged = true;
-    }
-
     if (!render) {
+      this.beamRenderEnabled = false;
       return false;
     }
 
-    if (!this.cpu.vramDirty && !this.borderDirty && !flashChanged) {
-      return false;
+    let rawRendered = false;
+    if (this.beamActive) {
+      if (this.beamPos < (SCREEN_HEIGHT << 9)) {
+        renderBeamSpan(
+          this.beamTargetBuf,
+          this.ramPages[this.screenBankIdx],
+          this.borderColor,
+          this.flashPhase,
+          this.beamPos,
+          SCREEN_HEIGHT << 9
+        );
+      }
+      this.invalidateTargetBorderCache();
+      this.prevFrameUsedBeam = true;
+      rawRendered = true;
+    } else if (
+      this.cpu.vramDirty ||
+      this.borderDirty ||
+      flashChanged ||
+      this.prevFrameUsedBeam
+    ) {
+      this.beginRawFrameTarget();
+      const borderIdx = this.borderColor & 0x07;
+      const paintBorder = this.shouldPaintTargetBorder(borderIdx);
+      renderStaticFrame(
+        this.beamTargetBuf,
+        this.ramPages[this.screenBankIdx],
+        borderIdx,
+        this.flashPhase,
+        paintBorder
+      );
+      if (paintBorder) {
+        this.markTargetBorderPainted(borderIdx);
+      }
+      this.prevFrameUsedBeam = false;
+      rawRendered = true;
     }
 
-    this.renderFrame();
+    this.beamRenderEnabled = false;
     this.cpu.vramDirty = false;
     this.borderDirty = false;
-    this.lastBorderLine = 0;
+
+    if (!rawRendered) {
+      if (this.outputIsBlended && this.gigascreenMode !== 'off') {
+        this.frameBuffer.set(this.currRaw);
+        this.outputIsBlended = false;
+        this.bankFlipStreak = 0;
+        this.hashFlipStreak = 0;
+        this.autoBlendHold = 0;
+        return true;
+      }
+      return false;
+    }
+
+    this.presentRenderedRawFrame();
     return true;
   }
 
   public renderFrame(): void {
-    const fb = this.frameBuffer;
-    const scr = this.ramPages[this.screenBankIdx];
+    this.hasPrevRaw = false;
+    this.outputIsBlended = false;
+    this.prevFrameUsedBeam = false;
+    this.bankFlipStreak = 0;
+    this.hashFlipStreak = 0;
+    this.autoBlendHold = 0;
+    this.hasHash1 = false;
+    this.hasHash2 = false;
+    this.prevScreenEndBank = this.screenBankIdx;
+
     const borderIdx = this.borderColor & 0x07;
-    const borderPx = PALETTE_ABGR[borderIdx];
-    const hasScanlineBorder = this.lastBorderLine > 0;
-    const paintBorder =
-      hasScanlineBorder || this.paintedWasScanline || this.paintedBorderColor !== borderIdx;
-    const bLines = this.borderLines;
-    const flash = this.flashPhase;
-
-    if (paintBorder) {
-      if (hasScanlineBorder) {
-        for (let y = 0; y < BORDER_Y; y++) {
-          const dst = y * SCREEN_WIDTH;
-          fb.fill(PALETTE_ABGR[bLines[y] & 0x07], dst, dst + SCREEN_WIDTH);
-        }
+    if (this.gigascreenMode === 'off') {
+      renderStaticFrame(
+        this.frameBuffer,
+        this.ramPages[this.screenBankIdx],
+        borderIdx,
+        this.flashPhase,
+        true
+      );
+      this.paintedBorderOut = borderIdx;
+    } else {
+      renderStaticFrame(
+        this.currRaw,
+        this.ramPages[this.screenBankIdx],
+        borderIdx,
+        this.flashPhase,
+        true
+      );
+      if (this.currTargetIsA) {
+        this.paintedBorderA = borderIdx;
+        this.paintedBorderB = -1;
       } else {
-        fb.fill(borderPx, 0, BORDER_Y * SCREEN_WIDTH);
+        this.paintedBorderB = borderIdx;
+        this.paintedBorderA = -1;
       }
+      this.frameBuffer.set(this.currRaw);
     }
-
-    for (let y = 0; y < 192; y++) {
-      const screenRow = y + BORDER_Y;
-      const rowBase = screenRow * SCREEN_WIDTH;
-      let rowBorderPx = borderPx;
-      if (paintBorder) {
-        rowBorderPx = hasScanlineBorder ? PALETTE_ABGR[bLines[screenRow] & 0x07] : borderPx;
-        fb.fill(rowBorderPx, rowBase, rowBase + BORDER_X);
-      }
-      let dst = rowBase + BORDER_X;
-
-      const pixOff = Y_TO_PIXEL_OFF[y];
-      const attrOff = Y_TO_ATTR_OFF[y];
-
-      for (let col = 0; col < 32; col++) {
-        const pixels = scr[pixOff + col];
-        const attr = scr[attrOff + col];
-        const bright = (attr & 0x40) >> 3;
-        let ink = PALETTE_ABGR[(attr & 0x07) | bright];
-        let paper = PALETTE_ABGR[((attr >> 3) & 0x07) | bright];
-
-        if ((attr & 0x80) !== 0 && flash) {
-          const tmp = ink;
-          ink = paper;
-          paper = tmp;
-        }
-
-        fb[dst]     = (pixels & 0x80) ? ink : paper;
-        fb[dst + 1] = (pixels & 0x40) ? ink : paper;
-        fb[dst + 2] = (pixels & 0x20) ? ink : paper;
-        fb[dst + 3] = (pixels & 0x10) ? ink : paper;
-        fb[dst + 4] = (pixels & 0x08) ? ink : paper;
-        fb[dst + 5] = (pixels & 0x04) ? ink : paper;
-        fb[dst + 6] = (pixels & 0x02) ? ink : paper;
-        fb[dst + 7] = (pixels & 0x01) ? ink : paper;
-        dst += 8;
-      }
-
-      if (paintBorder) {
-        fb.fill(rowBorderPx, dst, dst + BORDER_X);
-      }
-    }
-
-    if (paintBorder) {
-      if (hasScanlineBorder) {
-        for (let y = BORDER_Y + ACTIVE_HEIGHT; y < SCREEN_HEIGHT; y++) {
-          const dst = y * SCREEN_WIDTH;
-          fb.fill(PALETTE_ABGR[bLines[y] & 0x07], dst, dst + SCREEN_WIDTH);
-        }
-        this.paintedBorderColor = -1;
-        this.paintedWasScanline = true;
-      } else {
-        fb.fill(borderPx, (BORDER_Y + ACTIVE_HEIGHT) * SCREEN_WIDTH, SCREEN_HEIGHT * SCREEN_WIDTH);
-        this.paintedBorderColor = borderIdx;
-        this.paintedWasScanline = false;
-      }
-    }
+    this.hasRenderedFrame = true;
   }
 }

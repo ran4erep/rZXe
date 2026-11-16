@@ -21,6 +21,8 @@ export interface MachineProfile {
   hasAY: boolean;
   hasTrdos: boolean;
   tstatesPerFrame: number;
+  tstatesPerLine: number;
+  firstActiveT: number;   // T-state of pixel (0, 0) from frame interrupt
   ayClockHz: number;
   romKeys: RomKey[];      // 16KB ROM banks (1, 2, or 3+ banks)
   trdosRomKey?: RomKey;   // 16KB TR-DOS ROM
@@ -38,6 +40,8 @@ export const MACHINE_PROFILES: MachineProfile[] = [
     hasAY: false,
     hasTrdos: false,
     tstatesPerFrame: 69888,
+    tstatesPerLine: 224,
+    firstActiveT: 14336,
     ayClockHz: 1_750_000,
     romKeys: ['rom48'],
   },
@@ -52,6 +56,8 @@ export const MACHINE_PROFILES: MachineProfile[] = [
     hasAY: true,
     hasTrdos: false,
     tstatesPerFrame: 70908,
+    tstatesPerLine: 228,
+    firstActiveT: 14364,
     ayClockHz: 1_773_400,
     romKeys: ['rom128_0', 'rom128_1'],
   },
@@ -66,6 +72,8 @@ export const MACHINE_PROFILES: MachineProfile[] = [
     hasAY: true,
     hasTrdos: false,
     tstatesPerFrame: 70908,
+    tstatesPerLine: 228,
+    firstActiveT: 14364,
     ayClockHz: 1_773_400,
     romKeys: ['romPlus2_0', 'romPlus2_1'],
   },
@@ -80,6 +88,8 @@ export const MACHINE_PROFILES: MachineProfile[] = [
     hasAY: true,
     hasTrdos: true,
     tstatesPerFrame: 71680,
+    tstatesPerLine: 224,
+    firstActiveT: 17920,
     ayClockHz: 1_750_000,
     romKeys: ['romPentagon'], // 32KB split into 2x16KB automatically
     trdosRomKey: 'romTrdos503',
@@ -95,6 +105,8 @@ export const MACHINE_PROFILES: MachineProfile[] = [
     hasAY: true,
     hasTrdos: true,
     tstatesPerFrame: 71680,
+    tstatesPerLine: 224,
+    firstActiveT: 17920,
     ayClockHz: 1_750_000,
     romKeys: ['romPentagon'],
     trdosRomKey: 'romTrdos604',
@@ -110,6 +122,8 @@ export const MACHINE_PROFILES: MachineProfile[] = [
     hasAY: true,
     hasTrdos: true,
     tstatesPerFrame: 71680,
+    tstatesPerLine: 224,
+    firstActiveT: 17920,
     ayClockHz: 1_750_000,
     romKeys: ['romScorp0', 'romScorp1', 'romScorp2'],
     trdosRomKey: 'romScorp3',

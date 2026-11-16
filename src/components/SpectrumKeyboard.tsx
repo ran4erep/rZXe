@@ -10,11 +10,14 @@ import {
   ArrowUp,
   ArrowRight,
   Settings,
+  Languages,
 } from 'lucide-react';
 import {
   SPECTRUM_KEYS,
   SpectrumKeySpec,
   KeyboardMatrix,
+  KeyboardLayout,
+  getSpectrumKeyDisplayLabel,
   JoystickMode,
   STICK_DEADZONE_PX,
   DPAD_DEADZONE_PX,
@@ -132,6 +135,8 @@ interface SpectrumKeyboardProps {
   fallbackGameKey?: string | null;
   activeGameLabel?: string | null;
   joystickMode?: JoystickMode;
+  keyboardLayout?: KeyboardLayout;
+  onToggleKeyboardLayout?: () => void;
 }
 
 const STICK_MAX_R = 46;
@@ -141,15 +146,24 @@ const TOUCHPAD_SENSITIVITY = 1.25;
 const EMPTY_KEYS: readonly string[] = [];
 
 const SINGLE_KEY_TUPLES = new Map<string, readonly string[]>();
+const CAPS_COMBO_TUPLES = new Map<string, readonly string[]>();
+const SYMBOL_COMBO_TUPLES = new Map<string, readonly string[]>();
+const CAPS_SYMBOL_COMBO_TUPLES = new Map<string, readonly string[]>();
 for (const row of SPECTRUM_KEYS) {
   for (const k of row) {
     SINGLE_KEY_TUPLES.set(k.id, [k.id]);
+    if (k.id !== 'CAPS' && k.id !== 'SYMBOL') {
+      CAPS_COMBO_TUPLES.set(k.id, ['CAPS', k.id]);
+      SYMBOL_COMBO_TUPLES.set(k.id, ['SYMBOL', k.id]);
+      CAPS_SYMBOL_COMBO_TUPLES.set(k.id, ['CAPS', 'SYMBOL', k.id]);
+    }
   }
 }
 
 const NUMBER_ROW = SPECTRUM_KEYS[0];
 const ENTER_KEYS: readonly string[] = ['ENTER'];
 const SPACE_KEYS: readonly string[] = ['SPACE'];
+const EXTEND_KEYS: readonly string[] = ['CAPS', 'SYMBOL'];
 
 const ARROW_BUTTONS = [
   { id: 'ARROW_LEFT', Icon: ArrowLeft, ariaLabel: 'Стрелка влево (Shift + 5)', keys: ['CAPS', '5'] },
@@ -160,6 +174,7 @@ const ARROW_BUTTONS = [
 
 interface SpectrumKeyCellProps {
   spec: SpectrumKeySpec;
+  displayLabel: string;
   isFirstRow: boolean;
   isActive: boolean;
   isEditPulse?: boolean;
@@ -177,6 +192,7 @@ interface SpectrumKeyCellProps {
 const SpectrumKeyCell = React.memo<SpectrumKeyCellProps>(
   ({
     spec,
+    displayLabel,
     isFirstRow,
     isActive,
     isEditPulse = false,
@@ -187,6 +203,7 @@ const SpectrumKeyCell = React.memo<SpectrumKeyCellProps>(
     onKeyUp,
   }) => {
     const isLetterKey = spec.id.length === 1 && spec.id >= 'A' && spec.id <= 'Z';
+    const ariaLabel = displayLabel !== spec.label ? `${displayLabel} (${spec.label})` : spec.label;
 
     const handlePointerDown = useCallback(
       (e: React.PointerEvent<HTMLButtonElement>) => onKeyDown(e, spec, slotIndex),
@@ -235,7 +252,7 @@ const SpectrumKeyCell = React.memo<SpectrumKeyCellProps>(
         <button
           type="button"
           data-key-id={keyDataId}
-          aria-label={spec.label}
+          aria-label={ariaLabel}
           aria-pressed={isActive}
           onPointerDown={handlePointerDown}
           onPointerUp={onKeyUp}
@@ -286,7 +303,7 @@ const SpectrumKeyCell = React.memo<SpectrumKeyCellProps>(
                 {spec.symbol ?? '\u00A0'}
               </span>
               <span className="relative z-10 text-[11px] sm:text-[13.5px] font-bold leading-none zx-text-shadow">
-                {spec.label}
+                {displayLabel}
               </span>
               <span className="relative z-10 text-[5.5px] sm:text-[7px] font-semibold text-zinc-200 truncate max-w-full leading-none tracking-tighter zx-text-shadow">
                 {spec.keyword ?? '\u00A0'}
@@ -385,12 +402,32 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
   fallbackGameKey = null,
   activeGameLabel = null,
   joystickMode = 'kempston',
+  keyboardLayout: controlledLayout,
+  onToggleKeyboardLayout,
 }) => {
   const [padMode, setPadMode] = useState<'qwerty' | 'gamepad' | 'mouse'>('qwerty');
   const [gamepadType, setGamepadType] = useState<'stick' | 'dpad'>('stick');
+  const [uncontrolledLayout, setUncontrolledLayout] = useState<KeyboardLayout>('en');
+  const keyboardLayout = controlledLayout ?? uncontrolledLayout;
+  const handleToggleLayout = useCallback(() => {
+    if (onToggleKeyboardLayout) {
+      onToggleKeyboardLayout();
+    } else {
+      setUncontrolledLayout((prev) => (prev === 'ru' ? 'en' : 'ru'));
+    }
+  }, [onToggleKeyboardLayout]);
   const [pressedIds, setPressedIds] = useState<Set<string>>(() => new Set());
+  const [mouseLatchMask, setMouseLatchMask] = useState(0); // bit 0 = CAPS, bit 1 = SYMBOL
+  const mouseLatchMaskRef = useRef(0);
   const [dpadMask, setDpadMask] = useState(0);
   const [, setAssetsDecoded] = useState(graphicsReady);
+
+  const updateMouseLatchMask = useCallback((nextMask: number) => {
+    const masked = nextMask & 0x03;
+    if (mouseLatchMaskRef.current === masked) return;
+    mouseLatchMaskRef.current = masked;
+    setMouseLatchMask(masked);
+  }, []);
 
   const normalizedGameKey = normalizeGameMappingKey(activeGameKey);
   const normalizedFallbackKey = normalizeGameMappingKey(fallbackGameKey);
@@ -452,7 +489,10 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
   const activePointers = useRef(new Map<number, string>());
   // Track Shift pointer slides (pointer started on CAPS/SYMBOL and dragged onto a neighbor key)
   const shiftSlidePointersRef = useRef(
-    new Map<number, { shiftId: string; targetKeyId: string | null }>()
+    new Map<
+      number,
+      { shiftId: string; targetKeyId: string | null; isMouse: boolean; hadOtherKey: boolean }
+    >()
   );
 
   // Virtual stick refs (direct DOM updates avoid React re-renders per pointermove)
@@ -567,18 +607,24 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
       if (!hadPointer && !hadSlide) return;
 
       if (commitSlide && slide && slide.targetKeyId !== null) {
+        updateMouseLatchMask(0);
         triggerHaptic(11);
         keyboard.commitVirtualShiftSlide(pointerId, slide.shiftId, slide.targetKeyId);
       } else {
         keyboard.releaseVirtualButton(pointerId);
+        if (commitSlide && slide && slide.isMouse && slide.targetKeyId === null && !slide.hadOtherKey) {
+          const bit = slide.shiftId === 'CAPS' ? 1 : 2;
+          updateMouseLatchMask(mouseLatchMaskRef.current | bit);
+        }
       }
       syncPressedState();
     },
-    [keyboard, syncPressedState]
+    [keyboard, syncPressedState, updateMouseLatchMask]
   );
 
   const releaseAllPointers = useCallback(() => {
     shiftSlidePointersRef.current.clear();
+    updateMouseLatchMask(0);
     if (activePointers.current.size > 0) {
       activePointers.current.clear();
       setPressedIds(new Set());
@@ -587,11 +633,12 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
     resetDpad();
     resetTouchpad();
     keyboard.releaseAllVirtual();
-  }, [keyboard, resetDpad, resetStick, resetTouchpad]);
+  }, [keyboard, resetDpad, resetStick, resetTouchpad, updateMouseLatchMask]);
 
   // Ensure stick / dpad / touchpad / buttons release cleanly if user switches mode
   useEffect(() => {
     shiftSlidePointersRef.current.clear();
+    updateMouseLatchMask(0);
     if (activePointers.current.size > 0) {
       activePointers.current.clear();
       setPressedIds(new Set());
@@ -611,7 +658,7 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
       setPickingSlotIndex(null);
       setSaveMenuOpen(false);
     }
-  }, [padMode, gamepadType, keyboard, resetStick, resetDpad, resetTouchpad]);
+  }, [padMode, gamepadType, keyboard, resetStick, resetDpad, resetTouchpad, updateMouseLatchMask]);
 
   const updateStickFromClientPos = useCallback(
     (clientX: number, clientY: number) => {
@@ -829,9 +876,12 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
       const idx = idxAttr !== undefined ? Number(idxAttr) : -1;
       const arrow = ARROW_BUTTONS[idx];
       if (!arrow) return;
+      if (mouseLatchMaskRef.current !== 0) {
+        updateMouseLatchMask(0);
+      }
       pressVirtualButton(e, arrow.id, arrow.keys, 9);
     },
-    [pressVirtualButton]
+    [pressVirtualButton, updateMouseLatchMask]
   );
 
   const handlePadEnterDown = useCallback(
@@ -866,19 +916,68 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
 
   const handleKeyDown = useCallback(
     (e: React.PointerEvent<HTMLButtonElement>, spec: SpectrumKeySpec) => {
-      const keys = SINGLE_KEY_TUPLES.get(spec.id) ?? [spec.id];
-      const hapticMs = spec.isShift || spec.id === 'ENTER' || spec.id === 'SPACE' ? 12 : 9;
-      pressVirtualButton(e, spec.id, keys, hapticMs);
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+
+      for (const slide of shiftSlidePointersRef.current.values()) {
+        slide.hadOtherKey = true;
+      }
+
+      const isMouse = e.pointerType === 'mouse';
+      const latchMask = mouseLatchMaskRef.current;
+
       if (spec.isShift) {
+        const selfBit = spec.id === 'CAPS' ? 1 : 2;
+        const otherBit = spec.id === 'CAPS' ? 2 : 1;
+
+        if (isMouse && (latchMask & otherBit) !== 0) {
+          // Clicking SYMBOL after CAPS (or vice versa) sends CAPS+SYMBOL (EXTEND)
+          updateMouseLatchMask(0);
+          shiftSlidePointersRef.current.delete(e.pointerId);
+          pressVirtualButton(e, spec.id, EXTEND_KEYS, 12);
+          return;
+        }
+
+        if (isMouse && (latchMask & selfBit) !== 0) {
+          // Clicking the same latched Shift cancels the latch
+          e.preventDefault();
+          onUnlockAudio();
+          triggerHaptic(8);
+          updateMouseLatchMask(latchMask & ~selfBit);
+          return;
+        }
+
+        const keys = SINGLE_KEY_TUPLES.get(spec.id) ?? [spec.id];
+        pressVirtualButton(e, spec.id, keys, 12);
         shiftSlidePointersRef.current.set(e.pointerId, {
           shiftId: spec.id,
           targetKeyId: null,
+          isMouse,
+          hadOtherKey: false,
         });
-      } else {
-        shiftSlidePointersRef.current.delete(e.pointerId);
+        return;
       }
+
+      shiftSlidePointersRef.current.delete(e.pointerId);
+
+      let keys = SINGLE_KEY_TUPLES.get(spec.id) ?? [spec.id];
+      let hapticMs = spec.id === 'ENTER' || spec.id === 'SPACE' ? 12 : 9;
+      if (latchMask !== 0) {
+        updateMouseLatchMask(0);
+        if (isMouse) {
+          if (latchMask === 1) {
+            keys = CAPS_COMBO_TUPLES.get(spec.id) ?? ['CAPS', spec.id];
+          } else if (latchMask === 2) {
+            keys = SYMBOL_COMBO_TUPLES.get(spec.id) ?? ['SYMBOL', spec.id];
+          } else {
+            keys = CAPS_SYMBOL_COMBO_TUPLES.get(spec.id) ?? ['CAPS', 'SYMBOL', spec.id];
+          }
+          hapticMs = 11;
+        }
+      }
+
+      pressVirtualButton(e, spec.id, keys, hapticMs);
     },
-    [pressVirtualButton]
+    [onUnlockAudio, pressVirtualButton, updateMouseLatchMask]
   );
 
   const handleKeyUp = useCallback(
@@ -1115,7 +1214,11 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
           <>
             <span className="text-xs font-medium text-zinc-200 truncate">
               Кнопка {pickingSlotIndex + 1} («
-              {KEY_SPEC_BY_ID.get(draftTopRowIds[pickingSlotIndex])?.label ?? ''}»): выберите новую клавишу
+              {(() => {
+                const slotSpec = KEY_SPEC_BY_ID.get(draftTopRowIds[pickingSlotIndex]);
+                return slotSpec ? getSpectrumKeyDisplayLabel(slotSpec, keyboardLayout) : '';
+              })()}
+              »): выберите новую клавишу
             </span>
             <button
               type="button"
@@ -1210,8 +1313,36 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
               </button>
             </div>
 
-            {padMode !== 'qwerty' && (
-              <div ref={gearMenuRef} className="relative shrink-0">
+            <div className="flex items-center gap-1 shrink-0">
+              <button
+                type="button"
+                data-testid="keyboard-layout-btn"
+                aria-label={
+                  keyboardLayout === 'ru'
+                    ? 'Раскладка клавиатуры RU (ЙЦУКЕН), переключить на EN'
+                    : 'Раскладка клавиатуры EN (QWERTY), переключить на RU'
+                }
+                aria-pressed={keyboardLayout === 'ru'}
+                onPointerDown={(e) => {
+                  if (e.pointerType === 'mouse' && e.button !== 0) return;
+                  e.preventDefault();
+                  triggerHaptic(8);
+                  handleToggleLayout();
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    handleToggleLayout();
+                  }
+                }}
+                className="h-8 px-2 rounded-md text-[11px] font-semibold tracking-wide flex items-center gap-1 border border-white/10 bg-zinc-900 text-zinc-300 hover:text-white hover:bg-zinc-800 transition-colors cursor-pointer"
+              >
+                <Languages className="w-3.5 h-3.5" aria-hidden="true" />
+                <span>{keyboardLayout === 'ru' ? 'RU' : 'EN'}</span>
+              </button>
+
+              {padMode !== 'qwerty' && (
+                <div ref={gearMenuRef} className="relative shrink-0">
                 <button
                   type="button"
                   data-testid="top-row-edit-btn"
@@ -1323,8 +1454,9 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
                     </button>
                   </div>
                 )}
-              </div>
-            )}
+                </div>
+              )}
+            </div>
           </>
         )}
       </div>
@@ -1341,6 +1473,7 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
                 <SpectrumKeyCell
                   key={spec.id}
                   spec={spec}
+                  displayLabel={getSpectrumKeyDisplayLabel(spec, keyboardLayout)}
                   isFirstRow={rIdx === 0}
                   isActive={draftTopRowIds[pickingSlotIndex] === spec.id}
                   onKeyDown={handlePickKeyDown}
@@ -1357,17 +1490,23 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
         >
           {SPECTRUM_KEYS.map((row, rIdx) => (
             <div key={rIdx} className="flex items-stretch gap-1 shrink-0">
-              {row.map((spec) => (
-                <SpectrumKeyCell
-                  key={spec.id}
-                  spec={spec}
-                  keyDataId={spec.id}
-                  isFirstRow={rIdx === 0}
-                  isActive={pressedIds.has(spec.id)}
-                  onKeyDown={handleKeyDown}
-                  onKeyUp={handleKeyUp}
-                />
-              ))}
+              {row.map((spec) => {
+                const isLatched =
+                  (spec.id === 'CAPS' && (mouseLatchMask & 1) !== 0) ||
+                  (spec.id === 'SYMBOL' && (mouseLatchMask & 2) !== 0);
+                return (
+                  <SpectrumKeyCell
+                    key={spec.id}
+                    spec={spec}
+                    displayLabel={getSpectrumKeyDisplayLabel(spec, keyboardLayout)}
+                    keyDataId={spec.id}
+                    isFirstRow={rIdx === 0}
+                    isActive={pressedIds.has(spec.id) || isLatched}
+                    onKeyDown={handleKeyDown}
+                    onKeyUp={handleKeyUp}
+                  />
+                );
+              })}
             </div>
           ))}
 
@@ -1430,6 +1569,7 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
                 <SpectrumKeyCell
                   key={slotIdx}
                   spec={spec}
+                  displayLabel={getSpectrumKeyDisplayLabel(spec, keyboardLayout)}
                   isFirstRow
                   uniformWidth
                   slotIndex={slotIdx}
@@ -1702,6 +1842,7 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
                 <SpectrumKeyCell
                   key={slotIdx}
                   spec={spec}
+                  displayLabel={getSpectrumKeyDisplayLabel(spec, keyboardLayout)}
                   isFirstRow
                   uniformWidth
                   slotIndex={slotIdx}

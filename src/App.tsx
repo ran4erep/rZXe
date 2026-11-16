@@ -307,6 +307,7 @@ export default function App() {
     speccy.soundEnabled = settings.soundEnabled;
     speccy.setFastTapeLoad(settings.fastTapeLoad);
     speccy.setCpuFreqMhz(settings.cpuFreqMhz);
+    speccy.setGigascreenMode(settings.gigascreenMode);
     speccy.keyboard.setJoystickMode(settings.joystickMode);
     beeper.setVolume(settings.volume);
     beeper.setMuted(!settings.soundEnabled || paused || anyModalOpen, !settings.soundEnabled);
@@ -357,8 +358,10 @@ export default function App() {
     };
     paintFrameRef.current = paintBuffer;
 
-    // Draw initial frame immediately
-    speccy.renderFrame();
+    // Draw initial frame immediately if not yet rendered
+    if (!speccy.hasRenderedFrame) {
+      speccy.renderFrame();
+    }
     paintBuffer();
 
     let rafId = 0;
@@ -409,12 +412,13 @@ export default function App() {
           speccy.keyboard.pollHardwareGamepads(navigator.getGamepads());
         }
 
+        const needPrevRaw = settingsRef.current.gigascreenMode !== 'off';
+        let anyDirty = false;
         for (let s = 0; s < steps; s++) {
           const isLastStep = s === steps - 1;
-          const dirty = speccy.stepFrame(isLastStep);
-          // Blit framebuffer immediately before audio synthesis so compositor sees crisp timing
+          const dirty = speccy.stepFrame(isLastStep || needPrevRaw);
           if (dirty) {
-            paintBuffer();
+            anyDirty = true;
           }
           if (soundOn) {
             beeper.pushFrame(
@@ -430,6 +434,10 @@ export default function App() {
               ayClockHz
             );
           }
+        }
+        // Blit framebuffer once per RAF tick after frame stepping completes
+        if (anyDirty) {
+          paintBuffer();
         }
       }
 
@@ -1039,7 +1047,9 @@ export default function App() {
   const handleCaptureScreenshot = useCallback(async () => {
     const speccy = spectrumRef.current;
     if (!speccy) return;
-    speccy.renderFrame();
+    if (!speccy.hasRenderedFrame) {
+      speccy.renderFrame();
+    }
     const blob = await captureBorderless720pPngBlob(speccy.frameBuffer);
     if (!blob) {
       showStatus('Не удалось создать скриншот');
@@ -1074,6 +1084,13 @@ export default function App() {
       beeperRef.current?.start();
     }
     setSettings((prev) => ({ ...prev, ...patch }));
+  }, []);
+
+  const handleToggleKeyboardLayout = useCallback(() => {
+    setSettings((prev) => ({
+      ...prev,
+      keyboardLayout: prev.keyboardLayout === 'ru' ? 'en' : 'ru',
+    }));
   }, []);
 
   const handleLoadSaveStateVoid = useCallback(
@@ -1173,6 +1190,8 @@ export default function App() {
             fallbackGameKey={isVersionScoped ? null : (activeGameTitle ?? diskNames[0] ?? null)}
             activeGameLabel={activeGameTitle ?? diskNames[0] ?? null}
             joystickMode={settings.joystickMode}
+            keyboardLayout={settings.keyboardLayout}
+            onToggleKeyboardLayout={handleToggleKeyboardLayout}
           />
         )}
       </div>
