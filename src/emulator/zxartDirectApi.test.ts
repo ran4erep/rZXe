@@ -9,8 +9,8 @@ import {
   buildZxArtDirectReleasesUrl,
   downloadZxArtFileSmart,
   fetchZxArtCategoriesSmart,
+  fetchZxArtGamesSmart,
   fetchZxArtReleasesSmart,
-  getLocalProxyStatus,
   isHtmlOrJsonErrorPayload,
   isJsonContentType,
   normalizeZxArtDownloadUrl,
@@ -129,7 +129,7 @@ test('buildExternalProxyDownloadCandidates validates zxart URLs and rotates from
   assert.ok(rotated[0].url.startsWith('https://'));
 });
 
-test('smart fetchers fall back cleanly from static-host HTML/404 to direct zxart.ee and external CORS proxies', async () => {
+test('smart fetchers strictly call zxart.ee and external CORS proxies without local backend routes', async () => {
   const prevFetch = globalThis.fetch;
   const calls: string[] = [];
   resetProxyDiscoveryForTests();
@@ -139,14 +139,6 @@ test('smart fetchers fall back cleanly from static-host HTML/404 to direct zxart
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
       calls.push(url);
 
-      // Static hosting SPA fallback returns 200 text/html for api/zxart/*
-      if (url.startsWith('api/zxart/')) {
-        return new Response('<!doctype html><html><body>SPA</body></html>', {
-          status: 200,
-          headers: { 'content-type': 'text/html; charset=utf-8' },
-        });
-      }
-
       if (url.startsWith('https://zxart.ee/api/action:filter/export:zxProdCategory/')) {
         return new Response(
           JSON.stringify({
@@ -154,6 +146,28 @@ test('smart fetchers fall back cleanly from static-host HTML/404 to direct zxart
               zxProdCategory: [
                 { id: ZXART_GAMES_CATEGORY_ID, title: 'Игры', categories: [501] },
                 { id: 501, title: 'Платформеры' },
+              ],
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        );
+      }
+
+      if (url.startsWith('https://zxart.ee/api/action:filter/export:zxProd/')) {
+        return new Response(
+          JSON.stringify({
+            totalAmount: 1,
+            responseData: {
+              zxProd: [
+                {
+                  id: 98871,
+                  title: 'Exolon',
+                  year: '1987',
+                  votes: '42',
+                  rating: '4.9',
+                  categoriesIds: [501],
+                  releasesIds: [98874],
+                },
               ],
             },
           }),
@@ -181,16 +195,16 @@ test('smart fetchers fall back cleanly from static-host HTML/404 to direct zxart
       }
 
       // First two external proxies fail (403 limit / 429), third returns valid ZIP binary
-      if (url.startsWith('https://proxy.corsfix.com/')) {
-        return new Response('{"corsfix_error":"free_tier_transfer_limit"}', {
+      if (url.startsWith('https://corsmirror.com/')) {
+        return new Response('{"error":"upstream_timeout"}', {
           status: 403,
           headers: { 'content-type': 'application/json' },
         });
       }
-      if (url.startsWith('https://api.cors.lol/')) {
+      if (url.startsWith('https://cors.isteed.cc/')) {
         return new Response('Rate limit exceeded', { status: 429 });
       }
-      if (url.startsWith('https://api.codetabs.com/')) {
+      if (url.startsWith('https://allorigins.hexlet.app/')) {
         return new Response(new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0xaa, 0xbb]), {
           status: 200,
           headers: { 'content-type': 'application/zip' },
@@ -202,19 +216,28 @@ test('smart fetchers fall back cleanly from static-host HTML/404 to direct zxart
 
     const cats = await fetchZxArtCategoriesSmart();
     assert.deepEqual(cats, [{ id: 501, title: 'Платформеры' }]);
-    assert.equal(getLocalProxyStatus(), 'unavailable');
 
-    // Subsequent call should skip api/zxart/* completely once static mode is detected
+    const page = await fetchZxArtGamesSmart({
+      start: 0,
+      limit: 24,
+      categoryId: ZXART_GAMES_CATEGORY_ID,
+      order: 'votes,desc',
+      search: '',
+    });
+    assert.equal(page.games.length, 1);
+    assert.equal(page.games[0].id, 98871);
+
     const releases = await fetchZxArtReleasesSmart(98871);
     assert.equal(releases.length, 1);
-    assert.equal(
-      calls.filter((u) => u.startsWith('api/zxart/')).length,
-      1,
-      'must not keep hitting unavailable local proxy'
-    );
 
     const bytes = await downloadZxArtFileSmart('https://zxart.ee/releasefile/id:98874/Exolon.tzx.zip');
     assert.deepEqual(bytes, new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0xaa, 0xbb]));
+
+    assert.equal(
+      calls.some((u) => u.includes('api/zxart')),
+      false,
+      'must never touch local /api/zxart/* backend endpoints'
+    );
 
     // Repeated download of the same URL is served from memory with zero network calls
     const callsBeforeCached = calls.length;
@@ -222,47 +245,10 @@ test('smart fetchers fall back cleanly from static-host HTML/404 to direct zxart
     assert.deepEqual(cachedBytes, bytes);
     assert.equal(calls.length, callsBeforeCached);
 
-    // Different URL should immediately start with the remembered working proxy (codetabs)
+    // Different URL should immediately start with the remembered working proxy (allorigins-hexlet)
     const callsBeforeSecondDownload = calls.length;
     await downloadZxArtFileSmart('https://zxart.ee/releasefile/id:98875/Exolon.tap.zip');
-    assert.ok(calls[callsBeforeSecondDownload].startsWith('https://api.codetabs.com/'));
-  } finally {
-    globalThis.fetch = prevFetch;
-    resetProxyDiscoveryForTests();
-  }
-});
-
-test('smart fetchers stay on local same-origin proxy when server.ts responds with JSON', async () => {
-  const prevFetch = globalThis.fetch;
-  const calls: string[] = [];
-  resetProxyDiscoveryForTests();
-
-  try {
-    globalThis.fetch = (async (input: string | URL | Request) => {
-      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-      calls.push(url);
-      if (url === 'api/zxart/categories') {
-        return new Response(JSON.stringify({ categories: [{ id: 1, title: 'Логические' }] }), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        });
-      }
-      if (url.startsWith('api/zxart/download?')) {
-        return new Response(new Uint8Array([0x50, 0x4b, 0x03, 0x04]), {
-          status: 200,
-          headers: { 'content-type': 'application/octet-stream' },
-        });
-      }
-      throw new Error(`Unexpected external fetch: ${url}`);
-    }) as typeof fetch;
-
-    const cats = await fetchZxArtCategoriesSmart();
-    assert.deepEqual(cats, [{ id: 1, title: 'Логические' }]);
-    assert.equal(getLocalProxyStatus(), 'available');
-
-    const bytes = await downloadZxArtFileSmart('https://zxart.ee/releasefile/id:98874/Exolon.tzx.zip');
-    assert.deepEqual(bytes, new Uint8Array([0x50, 0x4b, 0x03, 0x04]));
-    assert.equal(calls.length, 2);
+    assert.ok(calls[callsBeforeSecondDownload].startsWith('https://allorigins.hexlet.app/'));
   } finally {
     globalThis.fetch = prevFetch;
     resetProxyDiscoveryForTests();
@@ -293,13 +279,10 @@ test('downloadZxArtFileSmart hedges slow primary proxy, aborts loser, and falls 
   let stalledAborted = false;
 
   try {
-    // 1) Primary proxy stalls past HEDGE_STAGGER_MS (1400ms), backup responds fast and aborts primary
+    // 1) Primary proxy stalls past HEDGE_STAGGER_MS (700ms), backup responds fast and aborts primary
     globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-      if (url.startsWith('api/zxart/')) {
-        return Promise.resolve(new Response('Not found', { status: 404 }));
-      }
-      if (url.startsWith('https://allorigins.hexlet.app/')) {
+      if (url.startsWith('https://corsmirror.com/')) {
         return new Promise<Response>((_resolve, reject) => {
           init?.signal?.addEventListener(
             'abort',
@@ -311,7 +294,7 @@ test('downloadZxArtFileSmart hedges slow primary proxy, aborts loser, and falls 
           );
         });
       }
-      if (url.startsWith('https://proxy.corsfix.com/')) {
+      if (url.startsWith('https://cors.isteed.cc/')) {
         return Promise.resolve(
           new Response(new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x11]), {
             status: 200,
@@ -332,12 +315,6 @@ test('downloadZxArtFileSmart hedges slow primary proxy, aborts loser, and falls 
     globalThis.fetch = (async (input: string | URL | Request) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
       seenUrls.push(url);
-      if (url.startsWith('api/zxart/')) {
-        return new Response('<html>SPA</html>', {
-          status: 200,
-          headers: { 'content-type': 'text/html' },
-        });
-      }
       const decoded = decodeURIComponent(url);
       if (decoded.endsWith('/id:598761/')) {
         return new Response(new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x99]), {
@@ -353,31 +330,26 @@ test('downloadZxArtFileSmart hedges slow primary proxy, aborts loser, and falls 
     );
     assert.deepEqual(wave2Bytes, new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x99]));
     assert.ok(seenUrls.some((u) => decodeURIComponent(u).endsWith('/id:598761/')));
+    assert.equal(seenUrls.some((u) => u.includes('api/zxart')), false);
   } finally {
     globalThis.fetch = prevFetch;
     resetProxyDiscoveryForTests();
   }
 });
 
-test('concurrent static-host calls deduplicate local probe and fall back to CORS JSON proxy if zxart.ee fails', async () => {
+test('direct API fetchers fall back to external CORS JSON proxy when zxart.ee fails', async () => {
   const prevFetch = globalThis.fetch;
   resetProxyDiscoveryForTests();
-  let localProbeCount = 0;
+  const seenUrls: string[] = [];
 
   try {
     globalThis.fetch = (async (input: string | URL | Request) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-      if (url.startsWith('api/zxart/')) {
-        localProbeCount++;
-        return new Response('<!doctype html><html></html>', {
-          status: 200,
-          headers: { 'content-type': 'text/html' },
-        });
-      }
+      seenUrls.push(url);
       if (url.startsWith('https://zxart.ee/api/')) {
         return new Response('Upstream error', { status: 503 });
       }
-      if (url.startsWith('https://allorigins.hexlet.app/')) {
+      if (url.startsWith('https://corsmirror.com/')) {
         const inner = decodeURIComponent(url.split('url=')[1] ?? '');
         if (inner.includes('export:zxProdCategory')) {
           return new Response(
@@ -418,7 +390,7 @@ test('concurrent static-host calls deduplicate local probe and fall back to CORS
       fetchZxArtCategoriesSmart(),
       fetchZxArtReleasesSmart(500),
     ]);
-    assert.equal(localProbeCount, 1, 'concurrent static calls must send only 1 local /api probe');
+    assert.equal(seenUrls.some((u) => u.includes('api/zxart')), false);
     assert.deepEqual(cats, [{ id: 12, title: 'Аркады' }]);
     assert.equal(rels.length, 1);
     assert.equal(rels[0].id, 1001);

@@ -305,32 +305,6 @@ const SettingsModalContent: React.FC<SettingsModalContentProps> = ({
               </div>
             </div>
 
-            {/* Desktop Kempston mouse mode */}
-            <div className="flex items-center justify-between gap-3">
-              <span className="text-xs font-medium text-zinc-200">Kempston мышь</span>
-              <div className="flex items-center gap-1 p-1 bg-zinc-900 rounded-lg border border-white/10">
-                {(
-                  [
-                    ['cursor', 'Курсор'],
-                    ['lock', 'Захват'],
-                    ['off', 'Выкл'],
-                  ] as const
-                ).map(([mode, label]) => (
-                  <button
-                    key={mode}
-                    type="button"
-                    onClick={() => onChange({ desktopMouseMode: mode })}
-                    className={`px-2.5 py-1 rounded-md text-xs font-medium cursor-pointer ${
-                      settings.desktopMouseMode === mode
-                        ? 'bg-zinc-700 text-white'
-                        : 'text-zinc-400 hover:text-zinc-200'
-                    }`}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-            </div>
           </CategorySection>
 
           <CategorySection

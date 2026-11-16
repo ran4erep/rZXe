@@ -16,7 +16,13 @@ import {
   SpectrumKeySpec,
   KeyboardMatrix,
   JoystickMode,
+  STICK_DEADZONE_PX,
+  DPAD_DEADZONE_PX,
   computeDpadMask,
+  createStickTouchState,
+  initStickTouchState,
+  stepStickTouchState,
+  StickTouchState,
 } from '../emulator/keyboard';
 import {
   DEFAULT_TOP_ROW_IDS,
@@ -129,8 +135,8 @@ interface SpectrumKeyboardProps {
 }
 
 const STICK_MAX_R = 46;
-const STICK_DEADZONE = 13;
-const DPAD_DEADZONE = 14;
+const STICK_ANCHOR_START_R = 30;
+const STICK_LEASH_DRIFT_R = 42;
 const TOUCHPAD_SENSITIVITY = 1.25;
 const EMPTY_KEYS: readonly string[] = [];
 
@@ -159,6 +165,7 @@ interface SpectrumKeyCellProps {
   isEditPulse?: boolean;
   uniformWidth?: boolean;
   slotIndex?: number;
+  keyDataId?: string;
   onKeyDown: (
     e: React.PointerEvent<HTMLButtonElement>,
     spec: SpectrumKeySpec,
@@ -175,6 +182,7 @@ const SpectrumKeyCell = React.memo<SpectrumKeyCellProps>(
     isEditPulse = false,
     uniformWidth = false,
     slotIndex,
+    keyDataId,
     onKeyDown,
     onKeyUp,
   }) => {
@@ -226,6 +234,7 @@ const SpectrumKeyCell = React.memo<SpectrumKeyCellProps>(
         {/* Rubber keycap */}
         <button
           type="button"
+          data-key-id={keyDataId}
           aria-label={spec.label}
           aria-pressed={isActive}
           onPointerDown={handlePointerDown}
@@ -441,12 +450,17 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
   const sectionRef = useRef<HTMLElement | null>(null);
   // Track pointerId -> pressed buttonId for crisp visual pressed state
   const activePointers = useRef(new Map<number, string>());
+  // Track Shift pointer slides (pointer started on CAPS/SYMBOL and dragged onto a neighbor key)
+  const shiftSlidePointersRef = useRef(
+    new Map<number, { shiftId: string; targetKeyId: string | null }>()
+  );
 
-  // Virtual stick refs (direct transform updates avoid React re-renders per pointermove)
+  // Virtual stick refs (direct DOM updates avoid React re-renders per pointermove)
   const stickBaseRef = useRef<HTMLDivElement | null>(null);
   const stickKnobRef = useRef<HTMLDivElement | null>(null);
   const stickPointerIdRef = useRef<number | null>(null);
   const stickCenterRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const stickTouchStateRef = useRef<StickTouchState>(createStickTouchState());
   const stickMaskRef = useRef(0);
 
   // Continuous D-Pad tracking refs (only re-renders when 4-bit direction mask changes)
@@ -468,6 +482,9 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
       if (prevMask === nextMask) return;
       stickMaskRef.current = nextMask;
       keyboard.setContinuousPadMask(nextMask);
+      if (stickBaseRef.current) {
+        stickBaseRef.current.dataset.stickMask = String(nextMask);
+      }
       if ((nextMask & ~prevMask) !== 0) {
         triggerHaptic(6);
       }
@@ -512,12 +529,18 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
   const syncPressedState = useCallback(() => {
     setPressedIds((prev) => {
       const ptrs = activePointers.current;
-      if (ptrs.size === 0) {
+      const slides = shiftSlidePointersRef.current;
+      if (ptrs.size === 0 && slides.size === 0) {
         return prev.size === 0 ? prev : new Set();
       }
       const next = new Set<string>();
       for (const buttonId of ptrs.values()) {
         next.add(buttonId);
+      }
+      for (const slide of slides.values()) {
+        if (slide.targetKeyId !== null) {
+          next.add(slide.targetKeyId);
+        }
       }
       if (next.size === prev.size) {
         let same = true;
@@ -535,7 +558,8 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
 
   const releasePointerById = useCallback(
     (pointerId: number) => {
-      if (!activePointers.current.has(pointerId)) return;
+      const hadSlide = shiftSlidePointersRef.current.delete(pointerId);
+      if (!activePointers.current.has(pointerId) && !hadSlide) return;
       activePointers.current.delete(pointerId);
       keyboard.releaseVirtualButton(pointerId);
       syncPressedState();
@@ -544,6 +568,7 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
   );
 
   const releaseAllPointers = useCallback(() => {
+    shiftSlidePointersRef.current.clear();
     if (activePointers.current.size > 0) {
       activePointers.current.clear();
       setPressedIds(new Set());
@@ -556,6 +581,7 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
 
   // Ensure stick / dpad / touchpad / buttons release cleanly if user switches mode
   useEffect(() => {
+    shiftSlidePointersRef.current.clear();
     if (activePointers.current.size > 0) {
       activePointers.current.clear();
       setPressedIds(new Set());
@@ -579,20 +605,29 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
 
   const updateStickFromClientPos = useCallback(
     (clientX: number, clientY: number) => {
-      let dx = clientX - stickCenterRef.current.x;
-      let dy = clientY - stickCenterRef.current.y;
-      const dist = Math.hypot(dx, dy);
-      if (dist > STICK_MAX_R) {
-        const scale = STICK_MAX_R / dist;
-        dx *= scale;
-        dy *= scale;
-      }
+      const st = stickTouchStateRef.current;
+      stepStickTouchState(
+        st,
+        clientX,
+        clientY,
+        stickCenterRef.current.x,
+        stickCenterRef.current.y,
+        STICK_MAX_R,
+        STICK_LEASH_DRIFT_R
+      );
 
       if (stickKnobRef.current) {
-        stickKnobRef.current.style.transform = `translate3d(${dx.toFixed(1)}px, ${dy.toFixed(1)}px, 0px)`;
+        stickKnobRef.current.style.transform = `translate3d(${st.clampedDx.toFixed(1)}px, ${st.clampedDy.toFixed(1)}px, 0px)`;
       }
 
-      applyStickMask(computeDpadMask(dx, dy, STICK_DEADZONE));
+      applyStickMask(
+        computeDpadMask(
+          st.dx,
+          st.dy,
+          STICK_DEADZONE_PX,
+          stickMaskRef.current
+        )
+      );
     },
     [applyStickMask]
   );
@@ -607,9 +642,27 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
           computeDpadMask(
             e.clientX - dpadCenterRef.current.x,
             e.clientY - dpadCenterRef.current.y,
-            DPAD_DEADZONE
+            DPAD_DEADZONE_PX,
+            dpadMaskRef.current
           )
         );
+      } else {
+        const slideState = shiftSlidePointersRef.current.get(e.pointerId);
+        if (slideState) {
+          const el = document.elementFromPoint(e.clientX, e.clientY);
+          const keyEl =
+            el instanceof Element ? (el.closest('[data-key-id]') as HTMLElement | null) : null;
+          const hitId = keyEl?.dataset.keyId ?? null;
+          const nextTarget = hitId !== null && hitId !== slideState.shiftId ? hitId : null;
+          if (slideState.targetKeyId !== nextTarget) {
+            slideState.targetKeyId = nextTarget;
+            keyboard.setVirtualShiftSlideTarget(e.pointerId, nextTarget);
+            if (nextTarget !== null) {
+              triggerHaptic(8);
+            }
+            syncPressedState();
+          }
+        }
       }
     };
     const onWindowPointerUp = (e: PointerEvent) => {
@@ -647,7 +700,7 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
       window.removeEventListener('blur', onWindowBlur);
       document.removeEventListener('visibilitychange', onVisibility);
     };
-  }, [applyDpadMask, releaseAllPointers, releasePointerById, resetDpad, resetStick, resetTouchpad, updateStickFromClientPos]);
+  }, [applyDpadMask, keyboard, releaseAllPointers, releasePointerById, resetDpad, resetStick, resetTouchpad, syncPressedState, updateStickFromClientPos]);
 
   // Suppress native browser long-press gesture & system vibration on touch screens
   useEffect(() => {
@@ -675,19 +728,39 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
       const base = stickBaseRef.current;
       if (!base) return;
       const rect = base.getBoundingClientRect();
-      stickCenterRef.current = {
-        x: rect.left + rect.width * 0.5,
-        y: rect.top + rect.height * 0.5,
-      };
+      const cx = rect.left + rect.width * 0.5;
+      const cy = rect.top + rect.height * 0.5;
+      stickCenterRef.current = { x: cx, y: cy };
       stickPointerIdRef.current = e.pointerId;
       try {
         e.currentTarget.setPointerCapture(e.pointerId);
       } catch {
         // Window pointermove fallback still tracks if capture is unsupported
       }
-      updateStickFromClientPos(e.clientX, e.clientY);
+
+      const st = stickTouchStateRef.current;
+      initStickTouchState(
+        st,
+        e.clientX,
+        e.clientY,
+        cx,
+        cy,
+        STICK_ANCHOR_START_R,
+        STICK_MAX_R
+      );
+      if (stickKnobRef.current) {
+        stickKnobRef.current.style.transform = `translate3d(${st.clampedDx.toFixed(1)}px, ${st.clampedDy.toFixed(1)}px, 0px)`;
+      }
+      applyStickMask(
+        computeDpadMask(
+          st.dx,
+          st.dy,
+          STICK_DEADZONE_PX,
+          0
+        )
+      );
     },
-    [onUnlockAudio, resetStick, updateStickFromClientPos]
+    [applyStickMask, onUnlockAudio, resetStick]
   );
 
   const handleStickMove = useCallback(
@@ -786,6 +859,14 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
       const keys = SINGLE_KEY_TUPLES.get(spec.id) ?? [spec.id];
       const hapticMs = spec.isShift || spec.id === 'ENTER' || spec.id === 'SPACE' ? 12 : 9;
       pressVirtualButton(e, spec.id, keys, hapticMs);
+      if (spec.isShift) {
+        shiftSlidePointersRef.current.set(e.pointerId, {
+          shiftId: spec.id,
+          targetKeyId: null,
+        });
+      } else {
+        shiftSlidePointersRef.current.delete(e.pointerId);
+      }
     },
     [pressVirtualButton]
   );
@@ -902,7 +983,14 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
       } catch {
         // Ignore if unsupported
       }
-      applyDpadMask(computeDpadMask(e.clientX - cx, e.clientY - cy, DPAD_DEADZONE));
+      applyDpadMask(
+        computeDpadMask(
+          e.clientX - cx,
+          e.clientY - cy,
+          DPAD_DEADZONE_PX,
+          0
+        )
+      );
     },
     [applyDpadMask, onUnlockAudio]
   );
@@ -912,12 +1000,14 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
       if (dpadPointerIdRef.current !== e.pointerId) return;
       e.preventDefault();
       e.stopPropagation();
-      const mask = computeDpadMask(
-        e.clientX - dpadCenterRef.current.x,
-        e.clientY - dpadCenterRef.current.y,
-        DPAD_DEADZONE
+      applyDpadMask(
+        computeDpadMask(
+          e.clientX - dpadCenterRef.current.x,
+          e.clientY - dpadCenterRef.current.y,
+          DPAD_DEADZONE_PX,
+          dpadMaskRef.current
+        )
       );
-      applyDpadMask(mask);
     },
     [applyDpadMask]
   );
@@ -1261,6 +1351,7 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
                 <SpectrumKeyCell
                   key={spec.id}
                   spec={spec}
+                  keyDataId={spec.id}
                   isFirstRow={rIdx === 0}
                   isActive={pressedIds.has(spec.id)}
                   onKeyDown={handleKeyDown}
@@ -1343,11 +1434,12 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
 
           <div className="relative flex-1 flex items-center justify-between gap-3 px-2.5 py-1 min-h-0">
             {gamepadType === 'stick' ? (
-              /* Authentic Kempston Stick */
+              /* Authentic Kempston Stick with deadzone & zero-rerender direction ring */
               <div
                 key="gamepad-stick-base"
                 ref={stickBaseRef}
                 data-testid="kempston-stick"
+                data-stick-mask="0"
                 onPointerDown={handleStickDown}
                 onPointerMove={handleStickMove}
                 onPointerUp={handleStickUp}

@@ -83,38 +83,32 @@ export function buildCanonicalZxArtDownloadUrl(fileUrl: string): string | null {
  */
 export const EXTERNAL_CORS_PROXIES: readonly ExternalCorsProxySpec[] = [
   {
+    id: 'corsmirror',
+    label: 'corsmirror.com',
+    buildUrl: (targetUrl) =>
+      `https://corsmirror.com/v1?url=${encodeURIComponent(targetUrl)}`,
+  },
+  {
+    id: 'isteed',
+    label: 'cors.isteed.cc',
+    buildUrl: (targetUrl) => `https://cors.isteed.cc/${encodeRawPathChars(targetUrl)}`,
+  },
+  {
     id: 'allorigins-hexlet',
     label: 'allorigins.hexlet.app',
     buildUrl: (targetUrl) =>
       `https://allorigins.hexlet.app/raw?url=${encodeURIComponent(targetUrl)}`,
   },
   {
-    id: 'corsfix-sdk',
-    label: 'proxy.corsfix.com',
-    buildUrl: (targetUrl) =>
-      `https://proxy.corsfix.com/?sdk=1&url=${encodeURIComponent(targetUrl)}`,
-  },
-  {
-    id: 'cors-lol',
-    label: 'api.cors.lol',
-    buildUrl: (targetUrl) => `https://api.cors.lol/?url=${encodeURIComponent(targetUrl)}`,
-  },
-  {
-    id: 'codetabs',
-    label: 'api.codetabs.com',
-    buildUrl: (targetUrl) =>
-      `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`,
+    id: 'cors-eu-org',
+    label: 'cors.eu.org',
+    buildUrl: (targetUrl) => `https://cors.eu.org/${encodeRawPathChars(targetUrl)}`,
   },
   {
     id: 'allorigins-raw',
     label: 'api.allorigins.win',
     buildUrl: (targetUrl) =>
       `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
-  },
-  {
-    id: 'cors-eu-org',
-    label: 'cors.eu.org',
-    buildUrl: (targetUrl) => `https://cors.eu.org/${encodeRawPathChars(targetUrl)}`,
   },
 ];
 
@@ -327,19 +321,13 @@ export function buildExternalProxyDownloadCandidates(
 }
 
 // ============================================================================
-// Runtime Browser Fetchers (Local Server Proxy -> Direct ZX-Art / Free CORS)
+// Runtime Browser Fetchers (Direct ZX-Art API + External CORS Proxies Only)
 // ============================================================================
 
-type LocalProxyStatus = 'unknown' | 'available' | 'unavailable';
-
-const PROXY_PREF_STORAGE_KEY = 'zxart_proxy_pref_v1';
-const STATIC_MODE_SESSION_KEY = 'zxart_static_mode_v1';
-const STATIC_MODE_TTL_MS = 3 * 60 * 1000;
+const PROXY_PREF_STORAGE_KEY = 'zxart_proxy_pref_v2';
 const RATE_LIMIT_COOLDOWN_MS = 60_000;
 const TRANSIENT_COOLDOWN_MS = 18_000;
 
-let localProxyStatus: LocalProxyStatus = 'unknown';
-let localProxyProbePromise: Promise<boolean> | null = null;
 let preferredExternalProxyIndex = 0;
 let stateHydrated = false;
 const PROXY_COOLDOWN_UNTIL = new Map<string, number>();
@@ -348,10 +336,10 @@ const DOWNLOADED_FILE_CACHE = new Map<string, Uint8Array>();
 const MAX_CACHED_DOWNLOAD_ENTRIES = 8;
 const MAX_CACHED_DOWNLOAD_ITEM_BYTES = 2 * 1024 * 1024;
 
-function getSafeStorage(kind: 'localStorage' | 'sessionStorage'): Storage | null {
+function getSafeLocalStorage(): Storage | null {
   try {
-    if (typeof window !== 'undefined' && window[kind]) {
-      return window[kind];
+    if (typeof window !== 'undefined' && window.localStorage) {
+      return window.localStorage;
     }
   } catch {
     // Ignore restricted storage access
@@ -363,7 +351,7 @@ function hydrateProxyStateOnce(): void {
   if (stateHydrated) return;
   stateHydrated = true;
 
-  const ls = getSafeStorage('localStorage');
+  const ls = getSafeLocalStorage();
   if (ls) {
     try {
       const savedId = ls.getItem(PROXY_PREF_STORAGE_KEY);
@@ -377,53 +365,12 @@ function hydrateProxyStateOnce(): void {
       // Ignore storage read errors
     }
   }
-
-  const ss = getSafeStorage('sessionStorage');
-  if (ss && localProxyStatus === 'unknown') {
-    try {
-      const raw = ss.getItem(STATIC_MODE_SESSION_KEY);
-      if (raw) {
-        const ts = Number(raw);
-        if (Number.isFinite(ts) && Date.now() - ts < STATIC_MODE_TTL_MS) {
-          localProxyStatus = 'unavailable';
-        } else {
-          ss.removeItem(STATIC_MODE_SESSION_KEY);
-        }
-      }
-    } catch {
-      // Ignore storage read errors
-    }
-  }
-}
-
-function markLocalProxyUnavailable(): void {
-  localProxyStatus = 'unavailable';
-  const ss = getSafeStorage('sessionStorage');
-  if (ss) {
-    try {
-      ss.setItem(STATIC_MODE_SESSION_KEY, String(Date.now()));
-    } catch {
-      // Ignore quota errors
-    }
-  }
-}
-
-function markLocalProxyAvailable(): void {
-  localProxyStatus = 'available';
-  const ss = getSafeStorage('sessionStorage');
-  if (ss) {
-    try {
-      ss.removeItem(STATIC_MODE_SESSION_KEY);
-    } catch {
-      // Ignore storage errors
-    }
-  }
 }
 
 function rememberPreferredProxy(index: number, id: string): void {
   preferredExternalProxyIndex = index;
   PROXY_COOLDOWN_UNTIL.delete(id);
-  const ls = getSafeStorage('localStorage');
+  const ls = getSafeLocalStorage();
   if (ls) {
     try {
       ls.setItem(PROXY_PREF_STORAGE_KEY, id);
@@ -441,31 +388,16 @@ function markProxyCooldown(id: string, status: number): void {
   PROXY_COOLDOWN_UNTIL.set(id, Date.now() + duration);
 }
 
-export function getLocalProxyStatus(): LocalProxyStatus {
-  hydrateProxyStateOnce();
-  return localProxyStatus;
-}
-
 export function resetProxyDiscoveryForTests(): void {
-  localProxyStatus = 'unknown';
-  localProxyProbePromise = null;
   preferredExternalProxyIndex = 0;
   stateHydrated = false;
   PROXY_COOLDOWN_UNTIL.clear();
   DOWNLOADED_FILE_CACHE.clear();
 
-  const ls = getSafeStorage('localStorage');
+  const ls = getSafeLocalStorage();
   if (ls) {
     try {
       ls.removeItem(PROXY_PREF_STORAGE_KEY);
-    } catch {
-      // Ignore
-    }
-  }
-  const ss = getSafeStorage('sessionStorage');
-  if (ss) {
-    try {
-      ss.removeItem(STATIC_MODE_SESSION_KEY);
     } catch {
       // Ignore
     }
@@ -518,7 +450,6 @@ function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 const DIRECT_API_TIMEOUT_MS = 9_500;
-const LOCAL_PROXY_TIMEOUT_MS = 3_000;
 
 async function fetchJsonViaSingleAttempt(
   url: string,
@@ -542,6 +473,7 @@ async function fetchJsonViaSingleAttempt(
 }
 
 async function fetchJsonDirect(url: string, signal?: AbortSignal): Promise<unknown> {
+  hydrateProxyStateOnce();
   let lastErr: unknown;
 
   // Try direct CORS-enabled ZX-Art API (plus 1 quick retry on transient blips)
@@ -591,81 +523,7 @@ async function fetchJsonDirect(url: string, signal?: AbortSignal): Promise<unkno
   throw lastErr instanceof Error ? lastErr : new Error('Не удалось загрузить данные с zxart.ee');
 }
 
-async function fetchLocalProxyJson<T>(localUrl: string, signal?: AbortSignal): Promise<T | null> {
-  hydrateProxyStateOnce();
-  if (localProxyStatus === 'unavailable') return null;
-
-  // Avoid firing redundant simultaneous /api/zxart/* probes on initial page load
-  if (localProxyStatus === 'unknown' && localProxyProbePromise) {
-    const hasBackend = await localProxyProbePromise;
-    if (!hasBackend) return null;
-  }
-
-  const runProbe = async (): Promise<{ ok: boolean; value: T | null }> => {
-    const { signal: attemptSignal, cleanup } = combineAbortSignals(signal, LOCAL_PROXY_TIMEOUT_MS);
-    try {
-      const res = await fetch(localUrl, { signal: attemptSignal });
-      if (res.status === 404 || res.status === 405 || res.status === 501) {
-        markLocalProxyUnavailable();
-        return { ok: false, value: null };
-      }
-
-      const ct = res.headers.get('content-type');
-      if (!isJsonContentType(ct)) {
-        // Static hosts with SPA fallback often return 200 text/html for /api/* paths
-        markLocalProxyUnavailable();
-        return { ok: false, value: null };
-      }
-
-      markLocalProxyAvailable();
-      if (!res.ok) {
-        const errBody = (await res.json().catch(() => ({}))) as { error?: string };
-        throw new Error(errBody.error || `Ошибка сервера (${res.status})`);
-      }
-      return { ok: true, value: (await res.json()) as T };
-    } catch (err) {
-      if (signal?.aborted) throw err;
-      if (localProxyStatus === 'available') throw err;
-      markLocalProxyUnavailable();
-      return { ok: false, value: null };
-    } finally {
-      cleanup();
-    }
-  };
-
-  if (localProxyStatus === 'unknown') {
-    let settleProbe!: (available: boolean) => void;
-    const gate = new Promise<boolean>((resolve) => {
-      settleProbe = resolve;
-    });
-    localProxyProbePromise = gate;
-    try {
-      const result = await runProbe();
-      settleProbe(result.ok);
-      return result.value;
-    } catch (err) {
-      settleProbe(getLocalProxyStatus() === 'available');
-      throw err;
-    } finally {
-      if (localProxyProbePromise === gate) {
-        localProxyProbePromise = null;
-      }
-    }
-  }
-
-  const result = await runProbe();
-  return result.value;
-}
-
 export async function fetchZxArtCategoriesSmart(signal?: AbortSignal): Promise<ZxArtCategory[]> {
-  const localData = await fetchLocalProxyJson<{ categories?: ZxArtCategory[] }>(
-    'api/zxart/categories',
-    signal
-  );
-  if (localData && Array.isArray(localData.categories)) {
-    return localData.categories;
-  }
-
   const rawJson = await fetchJsonDirect(buildZxArtDirectCategoriesUrl(), signal);
   return parseZxArtCategoriesResponse(rawJson);
 }
@@ -680,23 +538,6 @@ export async function fetchZxArtGamesSmart(
   },
   signal?: AbortSignal
 ): Promise<ZxArtDirectGamesPage> {
-  const qs = new URLSearchParams({
-    start: String(params.start),
-    limit: String(params.limit),
-    categoryId: String(params.categoryId),
-    order: params.order,
-  });
-  if (params.search) qs.set('search', params.search);
-
-  const localData = await fetchLocalProxyJson<ZxArtDirectGamesPage>(
-    `api/zxart/games?${qs.toString()}`,
-    signal
-  );
-  if (localData) {
-    return localData;
-  }
-
-  // Direct CORS-enabled ZX-Art API fallback (works on static hosting with no backend)
   const q = buildZxArtDirectGamesQuery(params);
 
   const [prodSettled, relSearchSettled] = await Promise.allSettled([
@@ -845,21 +686,13 @@ export async function fetchZxArtReleasesSmart(
   prodId: number,
   signal?: AbortSignal
 ): Promise<ZxArtPlayableRelease[]> {
-  const localData = await fetchLocalProxyJson<{ releases?: ZxArtPlayableRelease[] }>(
-    `api/zxart/releases/${prodId}`,
-    signal
-  );
-  if (localData && Array.isArray(localData.releases)) {
-    return localData.releases;
-  }
-
   const rawJson = await fetchJsonDirect(buildZxArtDirectReleasesUrl(prodId), signal);
   return parseZxArtReleasesResponse(rawJson);
 }
 
 const MAX_EXTERNAL_FILE_BYTES = 25 * 1024 * 1024;
-const EXTERNAL_PROXY_TIMEOUT_MS = 7_500;
-const HEDGE_STAGGER_MS = 1_400;
+const EXTERNAL_PROXY_TIMEOUT_MS = 12_000;
+const HEDGE_STAGGER_MS = 700;
 const MAX_CONCURRENT_HEDGES = 3;
 
 class OversizeDownloadError extends Error {
@@ -1087,39 +920,7 @@ export async function downloadZxArtFileSmart(
 
   const normalizedUrl = normalizeZxArtDownloadUrl(fileUrl);
 
-  // 1. Prefer same-origin backend proxy when available (fast, no rate limits)
-  if (localProxyStatus !== 'unavailable') {
-    try {
-      const localRes = await fetch(
-        `api/zxart/download?url=${encodeURIComponent(normalizedUrl)}`,
-        { signal }
-      );
-      const ct = localRes.headers.get('content-type');
-      const isStaticSpaHtml = ct !== null && ct.toLowerCase().includes('text/html');
-
-      if (localRes.status === 404 || localRes.status === 405 || localRes.status === 501 || isStaticSpaHtml) {
-        markLocalProxyUnavailable();
-      } else if (!localRes.ok) {
-        markLocalProxyAvailable();
-        const errBody = (await localRes.json().catch(() => ({}))) as { error?: string };
-        throw new Error(errBody.error || `Ошибка загрузки файла (${localRes.status})`);
-      } else {
-        const buf = new Uint8Array(await localRes.arrayBuffer());
-        if (!isHtmlOrJsonErrorPayload(buf, ct)) {
-          markLocalProxyAvailable();
-          cacheDownloadedFile(fileUrl, buf);
-          return buf;
-        }
-        markLocalProxyUnavailable();
-      }
-    } catch (err) {
-      if (signal?.aborted) throw err;
-      if (localProxyStatus === 'available') throw err;
-      markLocalProxyUnavailable();
-    }
-  }
-
-  // 2. Fallback for static sites: hedged proxy racing + canonical URL & retry wave
+  // Download strictly via external CORS proxies (identical on AI Studio and static sites)
   const wave1 = await downloadViaHedgedProxyWave(normalizedUrl, false, signal);
   if (wave1.oversize) {
     throw new Error('Файл слишком большой для загрузки');

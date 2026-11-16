@@ -142,6 +142,7 @@ export default function App() {
   const loopSleepingRef = useRef(false);
   loopSleepingRef.current = paused || anyModalOpen;
   const paintFrameRef = useRef<(() => void) | null>(null);
+  const hardwareGamepadActiveRef = useRef(false);
 
   const showStatus = useCallback((msg: string) => {
     setStatusBanner(msg);
@@ -389,6 +390,14 @@ export default function App() {
         const stereoMode = settingsRef.current.stereoMode;
         const ayClockHz = speccy.profile.ayClockHz;
 
+        if (
+          hardwareGamepadActiveRef.current &&
+          typeof navigator !== 'undefined' &&
+          typeof navigator.getGamepads === 'function'
+        ) {
+          speccy.keyboard.pollHardwareGamepads(navigator.getGamepads());
+        }
+
         for (let s = 0; s < steps; s++) {
           const isLastStep = s === steps - 1;
           const dirty = speccy.stepFrame(isLastStep);
@@ -469,6 +478,49 @@ export default function App() {
       if (rafId) cancelAnimationFrame(rafId);
     };
   }, [paused, anyModalOpen, settings.borderMode, flushDrivePersist, scheduleDrivePersist, triggerDriveActivity]);
+
+  // Hardware Gamepad API connect/disconnect listeners (zero CPU polling when no controller connected)
+  useEffect(() => {
+    const speccy = spectrumRef.current!;
+    const refreshGamepadPresence = () => {
+      if (typeof navigator === 'undefined' || typeof navigator.getGamepads !== 'function') {
+        hardwareGamepadActiveRef.current = false;
+        return;
+      }
+      const pads = navigator.getGamepads();
+      let active = false;
+      if (pads) {
+        for (let i = 0; i < pads.length; i++) {
+          if (pads[i]?.connected) {
+            active = true;
+            break;
+          }
+        }
+      }
+      hardwareGamepadActiveRef.current = active;
+      if (!active) {
+        speccy.keyboard.pollHardwareGamepads(null);
+      }
+    };
+
+    const onGamepadConnected = () => {
+      hardwareGamepadActiveRef.current = true;
+    };
+
+    const onGamepadDisconnected = () => {
+      refreshGamepadPresence();
+    };
+
+    refreshGamepadPresence();
+    window.addEventListener('gamepadconnected', onGamepadConnected);
+    window.addEventListener('gamepaddisconnected', onGamepadDisconnected);
+    window.addEventListener('focus', refreshGamepadPresence);
+    return () => {
+      window.removeEventListener('gamepadconnected', onGamepadConnected);
+      window.removeEventListener('gamepaddisconnected', onGamepadDisconnected);
+      window.removeEventListener('focus', refreshGamepadPresence);
+    };
+  }, []);
 
   // Cleanup Web Audio and timers on unmount
   useEffect(() => {
@@ -1084,7 +1136,6 @@ export default function App() {
           scanlines={settings.scanlines}
           borderMode={settings.borderMode}
           screenScale={settings.screenScale}
-          desktopMouseMode={settings.desktopMouseMode}
           paused={paused}
           modalOpen={anyModalOpen}
           showKeyboard={showKeyboard}

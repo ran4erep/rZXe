@@ -101,13 +101,29 @@ interface VirtualPointerAction {
   mouseButton?: 0 | 1 | 2;
 }
 
+export interface GamepadButtonLike {
+  pressed?: boolean;
+  value?: number;
+}
+
+export interface GamepadLike {
+  connected?: boolean;
+  axes?: ArrayLike<number>;
+  buttons?: ArrayLike<GamepadButtonLike | null | undefined>;
+}
+
+const HARDWARE_STICK_DEADZONE = 0.35;
+
 export class KeyboardMatrix {
   // 8 rows, bits 0..4 active low (0x1F = nothing pressed)
   public readonly rows = new Uint8Array(8);
   // Active sources per matrix position so multi-touch + physical keys never stomp each other
   private readonly counts = new Uint8Array(40);
-  // Kempston joystick bits: 0=R, 1=L, 2=D, 3=U, 4=Fire
+  // Kempston joystick bits: 0=R, 1=L, 2=D, 3=U, 4=Fire (virtual | hardware gamepad)
   public kempston = 0;
+  private virtualKempstonMask = 0;
+  private hardwareGamepadMask = 0;
+  private hardwareGamepadStickMask = 0;
   private readonly kempstonHoldFrames = new Uint8Array(5);
   private kempstonPendingMask = 0;
   private continuousPadMask = 0;
@@ -130,9 +146,14 @@ export class KeyboardMatrix {
   private readonly virtualPendingRelease = new Set<string>();
   private readonly virtualHoldFrames = new Map<string, number>();
   private readonly virtualPointers = new Map<number, VirtualPointerAction>();
+  private readonly virtualSlideTargets = new Map<number, string>();
 
   constructor() {
     this.rows.fill(0x1f);
+  }
+
+  private syncKempston(): void {
+    this.kempston = (this.virtualKempstonMask | this.hardwareGamepadMask) & 0x1f;
   }
 
   public clearAll(): void {
@@ -143,6 +164,10 @@ export class KeyboardMatrix {
     this.virtualPendingRelease.clear();
     this.virtualHoldFrames.clear();
     this.virtualPointers.clear();
+    this.virtualSlideTargets.clear();
+    this.virtualKempstonMask = 0;
+    this.hardwareGamepadMask = 0;
+    this.hardwareGamepadStickMask = 0;
     this.kempston = 0;
     this.kempstonPendingMask = 0;
     this.kempstonHoldFrames.fill(0);
@@ -193,7 +218,26 @@ export class KeyboardMatrix {
     }
   }
 
+  public setVirtualShiftSlideTarget(pointerId: number, targetKeyId: string | null): void {
+    const prevTarget = this.virtualSlideTargets.get(pointerId) ?? null;
+    if (prevTarget === targetKeyId) return;
+    if (prevTarget !== null) {
+      this.virtualSlideTargets.delete(pointerId);
+      this.setVirtualKey(prevTarget, false);
+    }
+    if (targetKeyId !== null) {
+      this.virtualSlideTargets.set(pointerId, targetKeyId);
+      this.setVirtualKey(targetKeyId, true);
+    }
+  }
+
   public releaseVirtualButton(pointerId: number): void {
+    const slideTarget = this.virtualSlideTargets.get(pointerId);
+    if (slideTarget !== undefined) {
+      this.virtualSlideTargets.delete(pointerId);
+      this.setVirtualKey(slideTarget, false);
+    }
+
     const action = this.virtualPointers.get(pointerId);
     if (!action) return;
     this.virtualPointers.delete(pointerId);
@@ -265,10 +309,10 @@ export class KeyboardMatrix {
       }
     }
 
-    if (this.kempston !== 0) {
+    if (this.virtualKempstonMask !== 0) {
       for (let bit = 0; bit < 5; bit++) {
         const mask = 1 << bit;
-        if ((this.kempston & mask) === 0) continue;
+        if ((this.virtualKempstonMask & mask) === 0) continue;
         const rem = this.kempstonHoldFrames[bit];
         if (rem > 1) {
           this.kempstonHoldFrames[bit] = rem - 1;
@@ -276,10 +320,11 @@ export class KeyboardMatrix {
           this.kempstonHoldFrames[bit] = 0;
           if ((this.kempstonPendingMask & mask) !== 0) {
             this.kempstonPendingMask &= ~mask;
-            this.kempston &= ~mask;
+            this.virtualKempstonMask &= ~mask;
           }
         }
       }
+      this.syncKempston();
     }
     if (this.mouseBtnPendingMask !== 0 || this.mouseButtons !== 0x07) {
       for (let bit = 0; bit < 3; bit++) {
@@ -302,6 +347,7 @@ export class KeyboardMatrix {
   public releaseAllVirtual(): void {
     this.setContinuousPadMask(0);
     this.virtualPointers.clear();
+    this.virtualSlideTargets.clear();
 
     if (this.virtualPressed.size > 0) {
       for (const id of this.virtualPressed) {
@@ -311,9 +357,10 @@ export class KeyboardMatrix {
     }
     this.virtualPendingRelease.clear();
     this.virtualHoldFrames.clear();
-    this.kempston = 0;
+    this.virtualKempstonMask = 0;
     this.kempstonPendingMask = 0;
     this.kempstonHoldFrames.fill(0);
+    this.syncKempston();
     this.mouseButtons = 0x07;
     this.mouseBtnPendingMask = 0;
     this.mouseBtnHoldFrames.fill(0);
@@ -359,12 +406,71 @@ export class KeyboardMatrix {
       return;
     }
 
-    this.kempston = (this.kempston & ~diff) | masked;
+    this.virtualKempstonMask = (this.virtualKempstonMask & ~diff) | masked;
     this.kempstonPendingMask &= ~diff;
     if ((diff & 0x01) !== 0) this.kempstonHoldFrames[0] = 0;
     if ((diff & 0x02) !== 0) this.kempstonHoldFrames[1] = 0;
     if ((diff & 0x04) !== 0) this.kempstonHoldFrames[2] = 0;
     if ((diff & 0x08) !== 0) this.kempstonHoldFrames[3] = 0;
+    this.syncKempston();
+  }
+
+  /**
+   * Zero-allocation read of modern HTML5 Gamepad API controllers into Kempston port 0x1F (bits 0..4).
+   * Combines D-pad (buttons 12..15), left analog stick (axes 0..1 with strict deadzone/sectors),
+   * and primary face/shoulder/trigger buttons (0..7) as Fire (bit 4).
+   */
+  public pollHardwareGamepads(pads: ArrayLike<GamepadLike | null | undefined> | null | undefined): void {
+    let nextFullMask = 0;
+    let nextStickMask = 0;
+
+    if (pads) {
+      for (let i = 0; i < pads.length; i++) {
+        const gp = pads[i];
+        if (!gp || !gp.connected) continue;
+
+        const axes = gp.axes;
+        if (axes && axes.length >= 2) {
+          const ax = axes[0];
+          const ay = axes[1];
+          const stickMask = computeDpadMask(
+            Number.isFinite(ax) ? ax : 0,
+            Number.isFinite(ay) ? ay : 0,
+            HARDWARE_STICK_DEADZONE,
+            this.hardwareGamepadStickMask
+          );
+          nextStickMask |= stickMask;
+          nextFullMask |= stickMask;
+        }
+
+        const btns = gp.buttons;
+        if (btns) {
+          if (btns.length > 12 && (btns[12]?.pressed || (btns[12]?.value ?? 0) > 0.5)) nextFullMask |= 0x08;
+          if (btns.length > 13 && (btns[13]?.pressed || (btns[13]?.value ?? 0) > 0.5)) nextFullMask |= 0x04;
+          if (btns.length > 14 && (btns[14]?.pressed || (btns[14]?.value ?? 0) > 0.5)) nextFullMask |= 0x02;
+          if (btns.length > 15 && (btns[15]?.pressed || (btns[15]?.value ?? 0) > 0.5)) nextFullMask |= 0x01;
+
+          const fireEnd = btns.length < 8 ? btns.length : 8;
+          for (let b = 0; b < fireEnd; b++) {
+            const btn = btns[b];
+            if (btn && (btn.pressed || (btn.value ?? 0) > 0.5)) {
+              nextFullMask |= 0x10;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    if ((nextFullMask & 0x03) === 0x03) nextFullMask &= ~0x03;
+    if ((nextFullMask & 0x0c) === 0x0c) nextFullMask &= ~0x0c;
+
+    this.hardwareGamepadStickMask = nextStickMask & 0x0f;
+    const masked = nextFullMask & 0x1f;
+    if (this.hardwareGamepadMask !== masked) {
+      this.hardwareGamepadMask = masked;
+      this.syncKempston();
+    }
   }
 
   public setKempstonDirection(bit: number, down: boolean): void {
@@ -377,18 +483,20 @@ export class KeyboardMatrix {
         const oppMask = 1 << oppBit;
         if ((this.kempstonPendingMask & oppMask) !== 0) {
           this.kempstonPendingMask &= ~oppMask;
-          this.kempston &= ~oppMask;
+          this.virtualKempstonMask &= ~oppMask;
           this.kempstonHoldFrames[oppBit] = 0;
         }
       }
       this.kempstonPendingMask &= ~mask;
       this.kempstonHoldFrames[bit] = MIN_VIRTUAL_HOLD_FRAMES;
-      this.kempston |= mask;
+      this.virtualKempstonMask |= mask;
+      this.syncKempston();
     } else {
-      if ((this.kempston & mask) === 0) return;
+      if ((this.virtualKempstonMask & mask) === 0) return;
       if (this.kempstonHoldFrames[bit] === 0) {
-        this.kempston &= ~mask;
+        this.virtualKempstonMask &= ~mask;
         this.kempstonPendingMask &= ~mask;
+        this.syncKempston();
       } else {
         this.kempstonPendingMask |= mask;
       }
@@ -493,7 +601,9 @@ export class KeyboardMatrix {
       }
     }
     this.physicalPressed.clear();
-    this.kempston = 0;
+    this.hardwareGamepadMask = 0;
+    this.hardwareGamepadStickMask = 0;
+    this.syncKempston();
     this.releasePhysicalMouseButtons();
   }
 
@@ -621,26 +731,158 @@ function mapPhysicalKey(code: string, key: string, shiftKey: boolean): readonly 
   }
 }
 
-const TAN_22_5 = Math.SQRT2 - 1;
+const DEG_TO_RAD = Math.PI / 180;
+
+// Strict 8-way diagonal entry/exit slopes for minor/major axis ratio (tan of cardinal half-angle):
+// ±37 deg cardinal sector (74 deg total) on entry prevents curved thumb arcs from misfiring diagonals;
+// ±32 deg exit slope adds 5 deg angular hysteresis to eliminate chatter along sector edges.
+const STRICT_ENTER_SLOPE = Math.tan(37 * DEG_TO_RAD); // ~0.7536
+const STRICT_EXIT_SLOPE = Math.tan(32 * DEG_TO_RAD);  // ~0.6249
+
+export const STICK_DEADZONE_PX = 20;
+export const DPAD_DEADZONE_PX = 21;
 
 /**
- * Compute 8-way D-Pad direction bitmask matching Kempston bits:
+ * Compute 8-way direction bitmask matching Kempston bits:
  * bit 0 (1) = Right, bit 1 (2) = Left, bit 2 (4) = Down, bit 3 (8) = Up.
+ * Zero-allocation with strict radial deadzone hysteresis and angular hysteresis
+ * so curved thumb arcs do not trigger unwanted diagonals or sector jitter.
  */
-export function computeDpadMask(dx: number, dy: number, deadzone = 14): number {
-  if (dx * dx + dy * dy < deadzone * deadzone) {
+export function computeDpadMask(
+  dx: number,
+  dy: number,
+  deadzone = STICK_DEADZONE_PX,
+  prevMask = 0
+): number {
+  const effectiveDeadzone = prevMask === 0 ? deadzone : deadzone * 0.75;
+  if (dx * dx + dy * dy < effectiveDeadzone * effectiveDeadzone) {
     return 0;
   }
-  const ax = Math.abs(dx);
-  const ay = Math.abs(dy);
-  let mask = 0;
-  if (ax > ay * TAN_22_5) {
-    mask |= dx > 0 ? 0x01 : 0x02;
+
+  const ax = dx < 0 ? -dx : dx;
+  const ay = dy < 0 ? -dy : dy;
+  const horizBit = dx >= 0 ? 0x01 : 0x02;
+  const vertBit = dy >= 0 ? 0x04 : 0x08;
+
+  const isDiagPrev = (prevMask & 0x03) !== 0 && (prevMask & 0x0c) !== 0;
+  const slope = isDiagPrev ? STRICT_EXIT_SLOPE : STRICT_ENTER_SLOPE;
+
+  if (ax >= ay) {
+    return ay > ax * slope ? horizBit | vertBit : horizBit;
   }
-  if (ay > ax * TAN_22_5) {
-    mask |= dy > 0 ? 0x04 : 0x08;
+  return ax > ay * slope ? horizBit | vertBit : vertBit;
+}
+
+export interface StickTouchState {
+  anchorX: number;
+  anchorY: number;
+  dx: number;
+  dy: number;
+  clampedDx: number;
+  clampedDy: number;
+}
+
+export function createStickTouchState(): StickTouchState {
+  return { anchorX: 0, anchorY: 0, dx: 0, dy: 0, clampedDx: 0, clampedDy: 0 };
+}
+
+/**
+ * Anchors a touch inside the knob radius directly under the finger (eliminating touch-down drift)
+ * while still allowing immediate directional taps when touching outside the center knob.
+ */
+export function initStickTouchState(
+  out: StickTouchState,
+  clientX: number,
+  clientY: number,
+  baseCenterX: number,
+  baseCenterY: number,
+  maxStartAnchorR = 30,
+  maxStickR = 46
+): void {
+  const offX = clientX - baseCenterX;
+  const offY = clientY - baseCenterY;
+  const distSq = offX * offX + offY * offY;
+  if (distSq <= maxStartAnchorR * maxStartAnchorR) {
+    out.anchorX = clientX;
+    out.anchorY = clientY;
+    out.dx = 0;
+    out.dy = 0;
+    out.clampedDx = 0;
+    out.clampedDy = 0;
+    return;
   }
-  return mask;
+
+  const dist = Math.sqrt(distSq);
+  const anchorScale = maxStartAnchorR / dist;
+  out.anchorX = baseCenterX + offX * anchorScale;
+  out.anchorY = baseCenterY + offY * anchorScale;
+
+  const dx = clientX - out.anchorX;
+  const dy = clientY - out.anchorY;
+  out.dx = dx;
+  out.dy = dy;
+
+  const dSq = dx * dx + dy * dy;
+  if (dSq > maxStickR * maxStickR) {
+    const knobScale = maxStickR / Math.sqrt(dSq);
+    out.clampedDx = dx * knobScale;
+    out.clampedDy = dy * knobScale;
+  } else {
+    out.clampedDx = dx;
+    out.clampedDy = dy;
+  }
+}
+
+/**
+ * Updates virtual stick delta and applies a bounded "leash" when dragged past maxStickR,
+ * keeping instant reverse-direction turnaround regardless of how far the thumb traveled.
+ */
+export function stepStickTouchState(
+  out: StickTouchState,
+  clientX: number,
+  clientY: number,
+  baseCenterX: number,
+  baseCenterY: number,
+  maxStickR = 46,
+  maxAnchorDriftR = 42
+): void {
+  let dx = clientX - out.anchorX;
+  let dy = clientY - out.anchorY;
+  const distSq = dx * dx + dy * dy;
+
+  if (distSq > maxStickR * maxStickR) {
+    const dist = Math.sqrt(distSq);
+    const excess = dist - maxStickR;
+    let nextAnchorX = out.anchorX + (dx / dist) * excess;
+    let nextAnchorY = out.anchorY + (dy / dist) * excess;
+
+    const driftX = nextAnchorX - baseCenterX;
+    const driftY = nextAnchorY - baseCenterY;
+    const driftSq = driftX * driftX + driftY * driftY;
+    if (driftSq > maxAnchorDriftR * maxAnchorDriftR) {
+      const driftScale = maxAnchorDriftR / Math.sqrt(driftSq);
+      nextAnchorX = baseCenterX + driftX * driftScale;
+      nextAnchorY = baseCenterY + driftY * driftScale;
+    }
+
+    out.anchorX = nextAnchorX;
+    out.anchorY = nextAnchorY;
+    dx = clientX - nextAnchorX;
+    dy = clientY - nextAnchorY;
+  }
+
+  out.dx = dx;
+  out.dy = dy;
+
+  const finalSq = dx * dx + dy * dy;
+  if (finalSq > maxStickR * maxStickR) {
+    const knobScale = maxStickR / Math.sqrt(finalSq);
+    out.clampedDx = dx * knobScale;
+    out.clampedDy = dy * knobScale;
+  } else {
+    out.clampedDx = dx;
+    out.clampedDy = dy;
+  }
 }
 
 /**

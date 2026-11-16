@@ -49,7 +49,6 @@ import {
   fetchZxArtCategoriesSmart,
   fetchZxArtGamesSmart,
   fetchZxArtReleasesSmart,
-  getLocalProxyStatus,
   normalizeZxArtDownloadUrl,
 } from '../emulator/zxartDirectApi';
 import {
@@ -349,7 +348,6 @@ export const ZxArtCatalog: React.FC<ZxArtCatalogProps> = ({
   const inFlightMoreRef = useRef(false);
   const moreAbortRef = useRef<AbortController | null>(null);
   const launchAbortRef = useRef<AbortController | null>(null);
-  const downloadAbortRef = useRef<AbortController | null>(null);
   const skipHistoryCommitRef = useRef(false);
 
   // O(1) lookup maps: aggregate count per game card (prodId/title) AND strict per-release list
@@ -704,8 +702,6 @@ export const ZxArtCatalog: React.FC<ZxArtCatalogProps> = ({
     if (targetDrive !== null) {
       launchAbortRef.current?.abort();
       launchAbortRef.current = null;
-      downloadAbortRef.current?.abort();
-      downloadAbortRef.current = null;
       setLaunchingRelease(false);
       setDownloadingReleaseId(null);
       setHistoryOpen(false);
@@ -725,8 +721,6 @@ export const ZxArtCatalog: React.FC<ZxArtCatalogProps> = ({
     lastExternalNonceRef.current = externalGameRequest.nonce;
     launchAbortRef.current?.abort();
     launchAbortRef.current = null;
-    downloadAbortRef.current?.abort();
-    downloadAbortRef.current = null;
     setLaunchingRelease(false);
     setDownloadingReleaseId(null);
     setHistoryOpen(false);
@@ -740,7 +734,6 @@ export const ZxArtCatalog: React.FC<ZxArtCatalogProps> = ({
   useEffect(() => {
     return () => {
       launchAbortRef.current?.abort();
-      downloadAbortRef.current?.abort();
     };
   }, []);
 
@@ -763,8 +756,6 @@ export const ZxArtCatalog: React.FC<ZxArtCatalogProps> = ({
   const handleBackToCatalog = useCallback(() => {
     launchAbortRef.current?.abort();
     launchAbortRef.current = null;
-    downloadAbortRef.current?.abort();
-    downloadAbortRef.current = null;
     setLaunchingRelease(false);
     setDownloadingReleaseId(null);
     setSelectedFormatFilter(null);
@@ -912,49 +903,23 @@ export const ZxArtCatalog: React.FC<ZxArtCatalogProps> = ({
   ]);
 
   const handleDownloadRelease = useCallback(
-    async (rel: ZxArtPlayableRelease) => {
+    (rel: ZxArtPlayableRelease) => {
       if (downloadingReleaseId !== null) return;
       onError(null);
       setDownloadingReleaseId(rel.id);
-      const ctrl = new AbortController();
-      downloadAbortRef.current = ctrl;
 
       try {
-        // On static hosting, trigger direct browser download without consuming external CORS proxy quota
-        if (getLocalProxyStatus() === 'unavailable') {
-          const link = document.createElement('a');
-          link.href = normalizeZxArtDownloadUrl(rel.fileUrl);
-          link.download = rel.fileName;
-          link.rel = 'noopener noreferrer';
-          link.style.display = 'none';
-          document.body.appendChild(link);
-          link.click();
-          document.body.removeChild(link);
-          return;
-        }
-
-        const bytes = await downloadZxArtFileSmart(rel.fileUrl, ctrl.signal);
-        if (ctrl.signal.aborted) return;
-
-        const copy = new Uint8Array(bytes.byteLength);
-        copy.set(bytes);
-        const blob = new Blob([copy.buffer], { type: 'application/octet-stream' });
-        const objectUrl = URL.createObjectURL(blob);
         const link = document.createElement('a');
-        link.href = objectUrl;
+        link.href = normalizeZxArtDownloadUrl(rel.fileUrl);
         link.download = rel.fileName;
+        link.rel = 'noopener noreferrer';
         link.style.display = 'none';
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
-        window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
       } catch (err) {
-        if (ctrl.signal.aborted) return;
         onError(err instanceof Error ? err.message : 'Не удалось скачать файл');
       } finally {
-        if (downloadAbortRef.current === ctrl) {
-          downloadAbortRef.current = null;
-        }
         setDownloadingReleaseId(null);
       }
     },

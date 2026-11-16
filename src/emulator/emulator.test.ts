@@ -31,7 +31,16 @@ import {
 } from './diskStorage';
 import { synthesizeBeeperFrame, createBeeperSynthState, levelToAmp } from './beeper';
 import { AY8910 } from './ay8910';
-import { KeyboardMatrix, encodeSpectrumStringKeys } from './keyboard';
+import {
+  KeyboardMatrix,
+  STICK_DEADZONE_PX,
+  DPAD_DEADZONE_PX,
+  computeDpadMask,
+  createStickTouchState,
+  encodeSpectrumStringKeys,
+  initStickTouchState,
+  stepStickTouchState,
+} from './keyboard';
 import {
   createFramePacerState,
   resetFramePacerState,
@@ -1630,12 +1639,134 @@ test('Desktop mouse delta scaling, button mapping, physical release, and desktop
   kb.releaseAllPhysical();
   assert.equal(kb.readMouseButtons() & 0x07, 0x07);
 
-  // Settings sanitizer preserves valid desktopMouseMode and rejects garbage
-  assert.equal(DEFAULT_EMULATOR_SETTINGS.desktopMouseMode, 'cursor');
-  assert.equal(sanitizeEmulatorSettings({ desktopMouseMode: 'lock' }).desktopMouseMode, 'lock');
-  assert.equal(sanitizeEmulatorSettings({ desktopMouseMode: 'off' }).desktopMouseMode, 'off');
-  assert.equal(sanitizeEmulatorSettings({ desktopMouseMode: 'invalid' }).desktopMouseMode, 'cursor');
+  // Settings sanitizer ignores removed desktopMouseMode without adding stale props
+  const sanitizedMouse = sanitizeEmulatorSettings({ desktopMouseMode: 'lock' });
+  assert.equal('desktopMouseMode' in sanitizedMouse, false);
 });
+
+test('Hardware Gamepad API polls D-pad, analog stick, and buttons as Kempston 0x1F independently of touch input', () => {
+  const speccy = new ZXSpectrum48('48k');
+  const kb = speccy.keyboard;
+
+  // 1. Standard D-Pad Up (btn 12) + Right (btn 15) + A button (btn 0 -> Fire)
+  kb.pollHardwareGamepads([
+    {
+      connected: true,
+      axes: [0, 0],
+      buttons: Array.from({ length: 16 }, (_, idx) => ({
+        pressed: idx === 12 || idx === 15 || idx === 0,
+        value: idx === 12 || idx === 15 || idx === 0 ? 1 : 0,
+      })),
+    },
+  ]);
+  assert.equal(speccy.readPort(0x001f), 0x08 | 0x01 | 0x10); // Up + Right + Fire
+
+  // 2. Left analog stick with strict wide cardinal sector (28 deg up-left -> pure Left) + R2 analog trigger (btn 7)
+  const x28 = -0.8 * Math.cos((28 * Math.PI) / 180);
+  const y28 = -0.8 * Math.sin((28 * Math.PI) / 180);
+  kb.pollHardwareGamepads([
+    {
+      connected: true,
+      axes: [x28, y28],
+      buttons: Array.from({ length: 16 }, (_, idx) => ({
+        pressed: false,
+        value: idx === 7 ? 0.85 : 0,
+      })),
+    },
+  ]);
+  assert.equal(speccy.readPort(0x001f), 0x02 | 0x10); // Pure Left + Fire
+
+  // 3. Releasing virtual touch stick to 0 must NOT clobber active hardware gamepad input
+  kb.setContinuousPadMask(0x04);
+  assert.equal(speccy.readPort(0x001f), 0x02 | 0x04 | 0x10);
+  kb.setContinuousPadMask(0);
+  assert.equal(speccy.readPort(0x001f), 0x02 | 0x10);
+
+  // 4. Disconnecting gamepad clears hardware Kempston bits cleanly
+  kb.pollHardwareGamepads(null);
+  assert.equal(speccy.readPort(0x001f), 0x00);
+});
+
+test('Virtual Shift slide keeps CAPS/SYMBOL pressed while dragging onto adjacent keys until pointer release', () => {
+  const speccy = new ZXSpectrum48('48k');
+  const kb = speccy.keyboard;
+
+  // Touch CAPS Shift with pointer 7
+  kb.pressVirtualButton(7, 'CAPS', ['CAPS']);
+  assert.equal((kb.readRows(0xfe) & 0x01) === 0, true); // CAPS down
+
+  // Slide finger from CAPS onto Z -> BOTH CAPS and Z must be active simultaneously
+  kb.setVirtualShiftSlideTarget(7, 'Z');
+  assert.equal((kb.readRows(0xfe) & 0x01) === 0, true); // CAPS still down
+  assert.equal((kb.readRows(0xfe) & 0x02) === 0, true); // Z down
+
+  // Slide from Z onto A -> Z scheduled for release while CAPS stays continuously down and A engages
+  kb.setVirtualShiftSlideTarget(7, 'A');
+  assert.equal((kb.readRows(0xfe) & 0x01) === 0, true); // CAPS still down
+  assert.equal((kb.readRows(0xfd) & 0x01) === 0, true); // A down
+
+  // Advance 3 frames -> Z finishes 3-frame latch cleanly while CAPS + A remain held
+  for (let i = 0; i < 3; i++) speccy.stepFrame(false);
+  assert.equal((kb.readRows(0xfe) & 0x01) === 0, true);  // CAPS still held
+  assert.equal((kb.readRows(0xfe) & 0x02) === 0, false); // Z released
+  assert.equal((kb.readRows(0xfd) & 0x01) === 0, true);  // A still held
+
+  // Lift finger -> after 3-frame tap latch, both CAPS and A release cleanly
+  kb.releaseVirtualButton(7);
+  for (let i = 0; i < 3; i++) speccy.stepFrame(false);
+  assert.equal(kb.readRows(0x00), 0x1f);
+});
+
+test('Touch joystick strict precision: wide cardinal sectors, angular/radial hysteresis, and floating anchor leash', () => {
+  assert.equal(STICK_DEADZONE_PX, 20);
+  assert.equal(DPAD_DEADZONE_PX, 21);
+
+  // 1. Strict wide cardinal sector shields up to ~35 degrees as pure Right (0x01) instead of leaking Up-Right
+  const ang35X = 35 * Math.cos((35 * Math.PI) / 180);
+  const ang35Y = -35 * Math.sin((35 * Math.PI) / 180);
+  assert.equal(computeDpadMask(ang35X, ang35Y, STICK_DEADZONE_PX, 0), 0x01);
+
+  // True 45 deg yields Up-Right diagonal (0x09)
+  assert.equal(computeDpadMask(28, -28, STICK_DEADZONE_PX, 0), 0x09);
+
+  // 2. Angular hysteresis: once diagonal (0x09) is engaged, 34 degrees retains diagonal (above 32 deg exit)
+  const ang34X = 35 * Math.cos((34 * Math.PI) / 180);
+  const ang34Y = -35 * Math.sin((34 * Math.PI) / 180);
+  assert.equal(computeDpadMask(ang34X, ang34Y, STICK_DEADZONE_PX, 0x09), 0x09);
+  // While starting from pure Right (0x01) at 34 degrees does NOT prematurely jump to diagonal
+  assert.equal(computeDpadMask(ang34X, ang34Y, STICK_DEADZONE_PX, 0x01), 0x01);
+
+  // 3. Radial deadzone hysteresis: 17px holds active direction (exit = 15px) but does not trigger from rest (20px)
+  assert.equal(computeDpadMask(17, 0, STICK_DEADZONE_PX, 0), 0x00);
+  assert.equal(computeDpadMask(17, 0, STICK_DEADZONE_PX, 0x01), 0x01);
+  assert.equal(computeDpadMask(14, 0, STICK_DEADZONE_PX, 0x01), 0x00);
+
+  // 4. Floating start anchor & bounded leash on Stick
+  const st = createStickTouchState();
+  // Touch inside knob radius (e.g. +20px off-center) starts at neutral (0, 0) -> no false movement on touchdown
+  initStickTouchState(st, 120, 200, 100, 200, 30, 46);
+  assert.equal(st.dx, 0);
+  assert.equal(st.dy, 0);
+  assert.equal(computeDpadMask(st.dx, st.dy, STICK_DEADZONE_PX, 0), 0);
+
+  // Dragging far right (+90px past anchor) engages Right (0x01) and pulls anchor up to max drift (42px)
+  stepStickTouchState(st, 210, 200, 100, 200, 46, 42);
+  assert.equal(st.clampedDx, 46);
+  assert.equal(st.anchorX, 142); // baseCenter 100 + maxDrift 42
+  assert.equal(computeDpadMask(st.dx, st.dy, STICK_DEADZONE_PX, 0), 0x01);
+
+  // Touching outer bezel (>30px from base center) activates direction immediately on touch
+  initStickTouchState(st, 160, 200, 100, 200, 30, 46);
+  assert.equal(st.anchorX, 130);
+  assert.equal(st.dx, 30);
+  assert.equal(computeDpadMask(st.dx, st.dy, STICK_DEADZONE_PX, 0), 0x01);
+
+  // 5. Legacy localStorage settings objects without removed keys sanitize cleanly without extra props
+  const sanitized = sanitizeEmulatorSettings({ joystickDirections: '4way', joystickPrecision: 'fast' });
+  assert.equal('joystickDirections' in sanitized, false);
+  assert.equal('joystickPrecision' in sanitized, false);
+});
+
 
 
 
