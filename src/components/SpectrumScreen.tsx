@@ -1,13 +1,21 @@
-import React from 'react';
+import React, { useCallback, useEffect, useRef } from 'react';
 import { BorderMode, getBorderViewport } from '../emulator/spectrum';
-import { ScreenScaleMode } from '../emulator/settingsStorage';
+import { ScreenScaleMode, DesktopMouseMode } from '../emulator/settingsStorage';
+import {
+  KeyboardMatrix,
+  computeDesktopMouseAxisDelta,
+  mapMouseButtonToKempstonBit,
+} from '../emulator/keyboard';
 
 interface SpectrumScreenProps {
   canvasRef: React.RefObject<HTMLCanvasElement | null>;
+  keyboard: KeyboardMatrix;
   scanlines: boolean;
   borderMode: BorderMode;
   screenScale: ScreenScaleMode;
+  desktopMouseMode: DesktopMouseMode;
   paused: boolean;
+  modalOpen: boolean;
   showKeyboard: boolean;
   statusBanner: string | null;
   onUnlockAudio: () => void;
@@ -15,15 +23,226 @@ interface SpectrumScreenProps {
 
 export const SpectrumScreen: React.FC<SpectrumScreenProps> = React.memo(({
   canvasRef,
+  keyboard,
   scanlines,
   borderMode,
   screenScale,
+  desktopMouseMode,
   paused,
+  modalOpen,
   showKeyboard,
   statusBanner,
   onUnlockAudio,
 }) => {
   const vp = getBorderViewport(borderMode);
+  const inputBlocked = paused || modalOpen || desktopMouseMode === 'off';
+
+  const cssSizeRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
+  const lastCursorRef = useRef<{ x: number; y: number } | null>(null);
+  const heldButtonsMaskRef = useRef(0);
+  const isLockedRef = useRef(false);
+
+  // Cache rendered canvas CSS size on mount & resize (zero layout reads during pointermove)
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const syncSize = () => {
+      cssSizeRef.current.w = canvas.clientWidth;
+      cssSizeRef.current.h = canvas.clientHeight;
+    };
+    syncSize();
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(syncSize);
+    ro.observe(canvas);
+    return () => ro.disconnect();
+  }, [canvasRef, borderMode, screenScale, showKeyboard]);
+
+  const releaseHeldMouseButtons = useCallback(() => {
+    if (heldButtonsMaskRef.current !== 0) {
+      heldButtonsMaskRef.current = 0;
+      keyboard.releasePhysicalMouseButtons();
+    }
+  }, [keyboard]);
+
+  // Clear cursor tracking, release held mouse buttons, and exit pointer lock when blocked
+  useEffect(() => {
+    if (!inputBlocked) return;
+    lastCursorRef.current = null;
+    releaseHeldMouseButtons();
+    const canvas = canvasRef.current;
+    if (canvas && typeof document !== 'undefined' && document.pointerLockElement === canvas) {
+      try {
+        document.exitPointerLock?.();
+      } catch {
+        // Ignore if unsupported
+      }
+    }
+  }, [inputBlocked, canvasRef, releaseHeldMouseButtons]);
+
+  // Keep pointer lock & off-canvas button releases in sync with zero polling
+  useEffect(() => {
+    const onPointerLockChange = () => {
+      const canvas = canvasRef.current;
+      isLockedRef.current =
+        Boolean(canvas) &&
+        typeof document !== 'undefined' &&
+        document.pointerLockElement === canvas;
+      lastCursorRef.current = null;
+      if (!isLockedRef.current) {
+        releaseHeldMouseButtons();
+      }
+    };
+
+    const onWindowPointerUp = (e: PointerEvent) => {
+      if (e.pointerType !== 'mouse' || heldButtonsMaskRef.current === 0) return;
+      const bit = mapMouseButtonToKempstonBit(e.button);
+      if (bit !== null && (heldButtonsMaskRef.current & (1 << bit)) !== 0) {
+        heldButtonsMaskRef.current &= ~(1 << bit);
+        keyboard.setKempstonMouseButton(bit, false);
+      }
+    };
+
+    const onWindowBlur = () => {
+      lastCursorRef.current = null;
+      releaseHeldMouseButtons();
+    };
+
+    document.addEventListener('pointerlockchange', onPointerLockChange);
+    window.addEventListener('pointerup', onWindowPointerUp);
+    window.addEventListener('blur', onWindowBlur);
+    return () => {
+      document.removeEventListener('pointerlockchange', onPointerLockChange);
+      window.removeEventListener('pointerup', onWindowPointerUp);
+      window.removeEventListener('blur', onWindowBlur);
+    };
+  }, [canvasRef, keyboard, releaseHeldMouseButtons]);
+
+  const handleCanvasPointerEnter = useCallback(
+    (e: React.PointerEvent<HTMLCanvasElement>) => {
+      if (e.pointerType !== 'mouse' || inputBlocked) return;
+      if (lastCursorRef.current) {
+        lastCursorRef.current.x = e.clientX;
+        lastCursorRef.current.y = e.clientY;
+      } else {
+        lastCursorRef.current = { x: e.clientX, y: e.clientY };
+      }
+    },
+    [inputBlocked]
+  );
+
+  const handleCanvasPointerLeave = useCallback((e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (e.pointerType !== 'mouse') return;
+    if (!isLockedRef.current) {
+      lastCursorRef.current = null;
+    }
+  }, []);
+
+  const handleCanvasPointerMove = useCallback(
+    (e: React.PointerEvent<HTMLCanvasElement>) => {
+      if (e.pointerType !== 'mouse' || inputBlocked) return;
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+
+      const locked = isLockedRef.current || document.pointerLockElement === canvas;
+      if (desktopMouseMode === 'lock' && !locked) return;
+
+      let rawDx = 0;
+      let rawDy = 0;
+
+      if (locked) {
+        rawDx = e.movementX;
+        rawDy = e.movementY;
+      } else {
+        const prev = lastCursorRef.current;
+        if (!prev) {
+          lastCursorRef.current = { x: e.clientX, y: e.clientY };
+          return;
+        }
+        rawDx = e.clientX - prev.x;
+        rawDy = e.clientY - prev.y;
+        prev.x = e.clientX;
+        prev.y = e.clientY;
+      }
+
+      if (rawDx === 0 && rawDy === 0) return;
+
+      const cssW = cssSizeRef.current.w || canvas.clientWidth || canvas.width;
+      const cssH = cssSizeRef.current.h || canvas.clientHeight || canvas.height;
+      const dx = computeDesktopMouseAxisDelta(rawDx, canvas.width, cssW);
+      const dy = computeDesktopMouseAxisDelta(rawDy, canvas.height, cssH);
+      if (dx !== 0 || dy !== 0) {
+        keyboard.moveKempstonMouse(dx, dy);
+      }
+    },
+    [canvasRef, desktopMouseMode, inputBlocked, keyboard]
+  );
+
+  const handleCanvasPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLCanvasElement>) => {
+      onUnlockAudio();
+      if (e.pointerType !== 'mouse' || inputBlocked) return;
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+
+      if (desktopMouseMode === 'lock') {
+        const locked = isLockedRef.current || document.pointerLockElement === canvas;
+        if (!locked) {
+          e.preventDefault();
+          try {
+            canvas.requestPointerLock?.();
+          } catch {
+            // Ignore unsupported Pointer Lock
+          }
+          return;
+        }
+      }
+
+      const bit = mapMouseButtonToKempstonBit(e.button);
+      if (bit === null) return;
+      e.preventDefault();
+      heldButtonsMaskRef.current |= 1 << bit;
+      keyboard.setKempstonMouseButton(bit, true);
+    },
+    [canvasRef, desktopMouseMode, inputBlocked, keyboard, onUnlockAudio]
+  );
+
+  const handleCanvasPointerUp = useCallback(
+    (e: React.PointerEvent<HTMLCanvasElement>) => {
+      if (e.pointerType !== 'mouse') return;
+      const bit = mapMouseButtonToKempstonBit(e.button);
+      if (bit !== null && (heldButtonsMaskRef.current & (1 << bit)) !== 0) {
+        heldButtonsMaskRef.current &= ~(1 << bit);
+        keyboard.setKempstonMouseButton(bit, false);
+      }
+    },
+    [keyboard]
+  );
+
+  const handleCanvasPointerCancel = useCallback(
+    (e: React.PointerEvent<HTMLCanvasElement>) => {
+      if (e.pointerType !== 'mouse') return;
+      releaseHeldMouseButtons();
+    },
+    [releaseHeldMouseButtons]
+  );
+
+  const handleCanvasContextMenu = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      if (!inputBlocked) {
+        e.preventDefault();
+      }
+    },
+    [inputBlocked]
+  );
+
+  const handleCanvasWheel = useCallback(
+    (e: React.WheelEvent<HTMLCanvasElement>) => {
+      if (inputBlocked) return;
+      if (desktopMouseMode === 'lock' && !isLockedRef.current) return;
+      keyboard.scrollKempstonMouse(e.deltaY);
+    },
+    [desktopMouseMode, inputBlocked, keyboard]
+  );
 
   const outerClassName =
     screenScale === 'stretch'
@@ -75,6 +294,15 @@ export const SpectrumScreen: React.FC<SpectrumScreenProps> = React.memo(({
             data-testid="spectrum-screen"
             data-border-mode={borderMode}
             data-scale-mode={screenScale}
+            data-desktop-mouse={desktopMouseMode}
+            onPointerEnter={handleCanvasPointerEnter}
+            onPointerLeave={handleCanvasPointerLeave}
+            onPointerMove={handleCanvasPointerMove}
+            onPointerDown={handleCanvasPointerDown}
+            onPointerUp={handleCanvasPointerUp}
+            onPointerCancel={handleCanvasPointerCancel}
+            onContextMenu={handleCanvasContextMenu}
+            onWheel={handleCanvasWheel}
             className="w-full h-full block pixelated [contain:layout_paint]"
           />
 

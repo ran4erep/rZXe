@@ -1606,6 +1606,37 @@ test('Seraphim.zip (.scl without boot file) auto-boots via TR-DOS RUN "Seraphim"
   assert.equal(speccy.ay.active, true, 'Expected AY-3-8910 music active in Seraphim');
 });
 
+test('Desktop mouse delta scaling, button mapping, physical release, and desktopMouseMode settings sanitization', async () => {
+  const { computeDesktopMouseAxisDelta, mapMouseButtonToKempstonBit } = await import('./keyboard');
+
+  // Scaling DOM pixel delta across arbitrary CSS canvas size -> Spectrum canvas pixels
+  assert.equal(computeDesktopMouseAxisDelta(10, 320, 640), 5);
+  assert.equal(computeDesktopMouseAxisDelta(-20, 240, 480, 1.5), -15);
+  assert.equal(computeDesktopMouseAxisDelta(0, 320, 640), 0);
+  assert.equal(computeDesktopMouseAxisDelta(10, 320, 0), 0);
+  assert.equal(computeDesktopMouseAxisDelta(Number.NaN, 320, 640), 0);
+
+  // DOM MouseEvent.button -> Kempston bit (0=L, 2=M, 1=R -> bit 0=L, 1=R, 2=M)
+  assert.equal(mapMouseButtonToKempstonBit(0), 0);
+  assert.equal(mapMouseButtonToKempstonBit(2), 1);
+  assert.equal(mapMouseButtonToKempstonBit(1), 2);
+  assert.equal(mapMouseButtonToKempstonBit(3), null);
+
+  // releaseAllPhysical and releasePhysicalMouseButtons clear held physical mouse buttons immediately
+  const kb = new KeyboardMatrix();
+  kb.setKempstonMouseButton(0, true);
+  kb.setKempstonMouseButton(1, true);
+  assert.equal(kb.readMouseButtons() & 0x07, 0x04);
+  kb.releaseAllPhysical();
+  assert.equal(kb.readMouseButtons() & 0x07, 0x07);
+
+  // Settings sanitizer preserves valid desktopMouseMode and rejects garbage
+  assert.equal(DEFAULT_EMULATOR_SETTINGS.desktopMouseMode, 'cursor');
+  assert.equal(sanitizeEmulatorSettings({ desktopMouseMode: 'lock' }).desktopMouseMode, 'lock');
+  assert.equal(sanitizeEmulatorSettings({ desktopMouseMode: 'off' }).desktopMouseMode, 'off');
+  assert.equal(sanitizeEmulatorSettings({ desktopMouseMode: 'invalid' }).desktopMouseMode, 'cursor');
+});
+
 
 
 

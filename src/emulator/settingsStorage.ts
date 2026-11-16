@@ -5,6 +5,7 @@ import { BorderMode } from './spectrum';
 export type { JoystickMode, BorderMode };
 export type KeyboardMode = 'auto' | 'show' | 'hide';
 export type ScreenScaleMode = 'auto' | 'aspect' | 'stretch';
+export type DesktopMouseMode = 'cursor' | 'lock' | 'off';
 
 export interface EmulatorSettings {
   soundEnabled: boolean;
@@ -16,6 +17,7 @@ export interface EmulatorSettings {
   cpuFreqMhz: number;
   keyboardMode: KeyboardMode;
   joystickMode: JoystickMode;
+  desktopMouseMode: DesktopMouseMode;
   fastTapeLoad: boolean;
 }
 
@@ -29,6 +31,7 @@ export const DEFAULT_EMULATOR_SETTINGS: EmulatorSettings = {
   cpuFreqMhz: 3.5,
   keyboardMode: 'auto',
   joystickMode: 'kempston',
+  desktopMouseMode: 'cursor',
   fastTapeLoad: true,
 };
 
@@ -96,6 +99,13 @@ export function sanitizeEmulatorSettings(raw: unknown): EmulatorSettings {
       ? obj.joystickMode
       : DEFAULT_EMULATOR_SETTINGS.joystickMode;
 
+  const desktopMouseMode: DesktopMouseMode =
+    obj.desktopMouseMode === 'cursor' ||
+    obj.desktopMouseMode === 'lock' ||
+    obj.desktopMouseMode === 'off'
+      ? obj.desktopMouseMode
+      : DEFAULT_EMULATOR_SETTINGS.desktopMouseMode;
+
   const fastTapeLoad =
     typeof obj.fastTapeLoad === 'boolean'
       ? obj.fastTapeLoad
@@ -111,6 +121,7 @@ export function sanitizeEmulatorSettings(raw: unknown): EmulatorSettings {
     cpuFreqMhz,
     keyboardMode,
     joystickMode,
+    desktopMouseMode,
     fastTapeLoad,
   };
 }

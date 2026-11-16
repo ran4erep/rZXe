@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   EXTERNAL_CORS_PROXIES,
+  buildCanonicalZxArtDownloadUrl,
   buildExternalProxyDownloadCandidates,
   buildZxArtDirectCategoriesUrl,
   buildZxArtDirectGamesQuery,
@@ -12,6 +13,7 @@ import {
   getLocalProxyStatus,
   isHtmlOrJsonErrorPayload,
   isJsonContentType,
+  normalizeZxArtDownloadUrl,
   parseZxArtCategoriesResponse,
   parseZxArtReleasesResponse,
   resetProxyDiscoveryForTests,
@@ -261,6 +263,165 @@ test('smart fetchers stay on local same-origin proxy when server.ts responds wit
     const bytes = await downloadZxArtFileSmart('https://zxart.ee/releasefile/id:98874/Exolon.tzx.zip');
     assert.deepEqual(bytes, new Uint8Array([0x50, 0x4b, 0x03, 0x04]));
     assert.equal(calls.length, 2);
+  } finally {
+    globalThis.fetch = prevFetch;
+    resetProxyDiscoveryForTests();
+  }
+});
+
+test('normalizeZxArtDownloadUrl and buildCanonicalZxArtDownloadUrl handle special chars safely without double-encoding', () => {
+  const dirty = 'https://zxart.ee/releasefile/id:598761/Valley of Rains (2019)[48K+128K]-tap.zip';
+  const norm = normalizeZxArtDownloadUrl(dirty);
+  assert.ok(!norm.includes(' '));
+  assert.ok(norm.includes('%20'));
+  assert.equal(normalizeZxArtDownloadUrl(norm), norm);
+
+  assert.equal(
+    buildCanonicalZxArtDownloadUrl(norm),
+    'https://zxart.ee/releasefile/id:598761/'
+  );
+  assert.equal(
+    buildCanonicalZxArtDownloadUrl('https://zxart.ee/releasefile/id:598761/'),
+    null
+  );
+  assert.equal(buildCanonicalZxArtDownloadUrl('https://evil.example.com/releasefile/id:1/foo'), null);
+});
+
+test('downloadZxArtFileSmart hedges slow primary proxy, aborts loser, and falls back to canonical Wave 2 URL', async () => {
+  const prevFetch = globalThis.fetch;
+  resetProxyDiscoveryForTests();
+  let stalledAborted = false;
+
+  try {
+    // 1) Primary proxy stalls past HEDGE_STAGGER_MS (1400ms), backup responds fast and aborts primary
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.startsWith('api/zxart/')) {
+        return Promise.resolve(new Response('Not found', { status: 404 }));
+      }
+      if (url.startsWith('https://allorigins.hexlet.app/')) {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            'abort',
+            () => {
+              stalledAborted = true;
+              reject(new DOMException('Aborted', 'AbortError'));
+            },
+            { once: true }
+          );
+        });
+      }
+      if (url.startsWith('https://proxy.corsfix.com/')) {
+        return Promise.resolve(
+          new Response(new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x11]), {
+            status: 200,
+            headers: { 'content-type': 'application/zip' },
+          })
+        );
+      }
+      return Promise.resolve(new Response('err', { status: 502 }));
+    }) as typeof fetch;
+
+    const bytes = await downloadZxArtFileSmart('https://zxart.ee/releasefile/id:777/Game.tap.zip');
+    assert.deepEqual(bytes, new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x11]));
+    assert.equal(stalledAborted, true, 'expected slow primary request to be aborted when hedge wins');
+
+    // 2) Wave 2 canonical id:<id>/ fallback when full filename URL is rejected across Wave 1 proxies
+    resetProxyDiscoveryForTests();
+    const seenUrls: string[] = [];
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      seenUrls.push(url);
+      if (url.startsWith('api/zxart/')) {
+        return new Response('<html>SPA</html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+        });
+      }
+      const decoded = decodeURIComponent(url);
+      if (decoded.endsWith('/id:598761/')) {
+        return new Response(new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x99]), {
+          status: 200,
+          headers: { 'content-type': 'application/zip' },
+        });
+      }
+      return new Response('Bad filename', { status: 400 });
+    }) as typeof fetch;
+
+    const wave2Bytes = await downloadZxArtFileSmart(
+      'https://zxart.ee/releasefile/id:598761/Bad [Name].zip'
+    );
+    assert.deepEqual(wave2Bytes, new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x99]));
+    assert.ok(seenUrls.some((u) => decodeURIComponent(u).endsWith('/id:598761/')));
+  } finally {
+    globalThis.fetch = prevFetch;
+    resetProxyDiscoveryForTests();
+  }
+});
+
+test('concurrent static-host calls deduplicate local probe and fall back to CORS JSON proxy if zxart.ee fails', async () => {
+  const prevFetch = globalThis.fetch;
+  resetProxyDiscoveryForTests();
+  let localProbeCount = 0;
+
+  try {
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.startsWith('api/zxart/')) {
+        localProbeCount++;
+        return new Response('<!doctype html><html></html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+        });
+      }
+      if (url.startsWith('https://zxart.ee/api/')) {
+        return new Response('Upstream error', { status: 503 });
+      }
+      if (url.startsWith('https://allorigins.hexlet.app/')) {
+        const inner = decodeURIComponent(url.split('url=')[1] ?? '');
+        if (inner.includes('export:zxProdCategory')) {
+          return new Response(
+            JSON.stringify({
+              responseData: {
+                zxProdCategory: [
+                  { id: ZXART_GAMES_CATEGORY_ID, title: 'Games', categories: [12] },
+                  { id: 12, title: 'Аркады' },
+                ],
+              },
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } }
+          );
+        }
+        if (inner.includes('export:zxRelease')) {
+          return new Response(
+            JSON.stringify({
+              responseData: {
+                zxRelease: [
+                  {
+                    id: 1001,
+                    fileName: 'Saboteur.tap',
+                    file: 'https://zxart.ee/releasefile/id:1001/Saboteur.tap',
+                    releaseType: 'original',
+                    releaseFormat: ['tap'],
+                  },
+                ],
+              },
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } }
+          );
+        }
+      }
+      return new Response('Not found', { status: 404 });
+    }) as typeof fetch;
+
+    const [cats, rels] = await Promise.all([
+      fetchZxArtCategoriesSmart(),
+      fetchZxArtReleasesSmart(500),
+    ]);
+    assert.equal(localProbeCount, 1, 'concurrent static calls must send only 1 local /api probe');
+    assert.deepEqual(cats, [{ id: 12, title: 'Аркады' }]);
+    assert.equal(rels.length, 1);
+    assert.equal(rels[0].id, 1001);
   } finally {
     globalThis.fetch = prevFetch;
     resetProxyDiscoveryForTests();

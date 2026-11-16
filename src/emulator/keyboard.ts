@@ -478,6 +478,14 @@ export class KeyboardMatrix {
     }
   }
 
+  public releasePhysicalMouseButtons(): void {
+    this.mouseButtons = 0x07;
+    this.mouseBtnPendingMask = 0;
+    this.mouseBtnHoldFrames.fill(0);
+    this.mouseFracX = 0;
+    this.mouseFracY = 0;
+  }
+
   public releaseAllPhysical(): void {
     for (const [, mapped] of this.physicalPressed) {
       for (let i = 0; i < mapped.length; i++) {
@@ -486,6 +494,7 @@ export class KeyboardMatrix {
     }
     this.physicalPressed.clear();
     this.kempston = 0;
+    this.releasePhysicalMouseButtons();
   }
 
   // Helper for tests / programmatic macro key injection
@@ -680,4 +689,31 @@ export function encodeSpectrumStringKeys(text: string): ReadonlyArray<readonly s
   }
   return result;
 }
+
+/**
+ * Scales a DOM mouse pixel delta into ZX Spectrum pixel coordinates without object allocations.
+ */
+export function computeDesktopMouseAxisDelta(
+  rawDelta: number,
+  internalPixels: number,
+  cssPixels: number,
+  sensitivity = 1
+): number {
+  if (!Number.isFinite(rawDelta) || rawDelta === 0) return 0;
+  if (!Number.isFinite(internalPixels) || internalPixels <= 0) return 0;
+  if (!Number.isFinite(cssPixels) || cssPixels <= 0) return 0;
+  return rawDelta * (internalPixels / cssPixels) * sensitivity;
+}
+
+/**
+ * Maps standard DOM MouseEvent.button (0=Left, 1=Middle, 2=Right)
+ * to Kempston Mouse button bit index (0=Left, 1=Right, 2=Middle).
+ */
+export function mapMouseButtonToKempstonBit(button: number): 0 | 1 | 2 | null {
+  if (button === 0) return 0;
+  if (button === 2) return 1;
+  if (button === 1) return 2;
+  return null;
+}
+
 

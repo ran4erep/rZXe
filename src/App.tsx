@@ -301,6 +301,9 @@ export default function App() {
     speccy.keyboard.setJoystickMode(settings.joystickMode);
     beeper.setVolume(settings.volume);
     beeper.setMuted(!settings.soundEnabled || paused || anyModalOpen);
+    if (paused || anyModalOpen) {
+      speccy.keyboard.releaseAllPhysical();
+    }
   }, [settings, paused, anyModalOpen]);
 
   // Main low-CPU 50Hz emulation loop (automatically sleeps when paused or tab is hidden)
@@ -1077,10 +1080,13 @@ export default function App() {
       >
         <SpectrumScreen
           canvasRef={canvasRef}
+          keyboard={spectrumRef.current.keyboard}
           scanlines={settings.scanlines}
           borderMode={settings.borderMode}
           screenScale={settings.screenScale}
+          desktopMouseMode={settings.desktopMouseMode}
           paused={paused}
+          modalOpen={anyModalOpen}
           showKeyboard={showKeyboard}
           statusBanner={statusBanner}
           onUnlockAudio={unlockAudio}

@@ -35,15 +35,64 @@ export interface ExternalCorsProxySpec {
   buildUrl: (targetUrl: string) => string;
 }
 
+function encodeRawPathChars(url: string): string {
+  return url
+    .replace(/ /g, '%20')
+    .replace(/\[/g, '%5B')
+    .replace(/\]/g, '%5D')
+    .replace(/\{/g, '%7B')
+    .replace(/\}/g, '%7D');
+}
+
+/**
+ * Normalizes ZX-Art file URLs (real API responses frequently contain raw spaces,
+ * parentheses, and brackets) without double-encoding existing %XX sequences.
+ */
+export function normalizeZxArtDownloadUrl(fileUrl: string): string {
+  const trimmed = fileUrl.trim();
+  try {
+    const parsed = new URL(trimmed);
+    return parsed.href.replace(/ /g, '%20');
+  } catch {
+    return encodeRawPathChars(trimmed);
+  }
+}
+
+/**
+ * Extracts canonical ID-only URL (e.g. `https://zxart.ee/releasefile/id:598761/`)
+ * as a clean fallback when filenames contain special characters that strict proxies choke on.
+ */
+export function buildCanonicalZxArtDownloadUrl(fileUrl: string): string | null {
+  try {
+    const parsed = new URL(fileUrl.trim());
+    if (parsed.protocol !== 'https:' || parsed.hostname !== 'zxart.ee') {
+      return null;
+    }
+    const m = /^\/releasefile\/(id:\d+)\//.exec(parsed.pathname);
+    if (!m) return null;
+    const canonical = `https://zxart.ee/releasefile/${m[1]}/`;
+    return canonical === fileUrl.trim() ? null : canonical;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Free, keyless, binary-safe public CORS proxies used automatically
  * when the app is deployed as pure static files without server.ts.
  */
 export const EXTERNAL_CORS_PROXIES: readonly ExternalCorsProxySpec[] = [
   {
+    id: 'allorigins-hexlet',
+    label: 'allorigins.hexlet.app',
+    buildUrl: (targetUrl) =>
+      `https://allorigins.hexlet.app/raw?url=${encodeURIComponent(targetUrl)}`,
+  },
+  {
     id: 'corsfix-sdk',
     label: 'proxy.corsfix.com',
-    buildUrl: (targetUrl) => `https://proxy.corsfix.com/?sdk=1&url=${encodeURIComponent(targetUrl)}`,
+    buildUrl: (targetUrl) =>
+      `https://proxy.corsfix.com/?sdk=1&url=${encodeURIComponent(targetUrl)}`,
   },
   {
     id: 'cors-lol',
@@ -53,17 +102,19 @@ export const EXTERNAL_CORS_PROXIES: readonly ExternalCorsProxySpec[] = [
   {
     id: 'codetabs',
     label: 'api.codetabs.com',
-    buildUrl: (targetUrl) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`,
+    buildUrl: (targetUrl) =>
+      `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`,
   },
   {
     id: 'allorigins-raw',
     label: 'api.allorigins.win',
-    buildUrl: (targetUrl) => `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
+    buildUrl: (targetUrl) =>
+      `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
   },
   {
     id: 'cors-eu-org',
     label: 'cors.eu.org',
-    buildUrl: (targetUrl) => `https://cors.eu.org/${targetUrl}`,
+    buildUrl: (targetUrl) => `https://cors.eu.org/${encodeRawPathChars(targetUrl)}`,
   },
 ];
 
@@ -254,6 +305,7 @@ export function buildExternalProxyDownloadCandidates(
     return [];
   }
 
+  const normalizedUrl = normalizeZxArtDownloadUrl(targetUrl);
   const count = EXTERNAL_CORS_PROXIES.length;
   const start =
     Number.isInteger(preferredIndex) && preferredIndex >= 0 && preferredIndex < count
@@ -268,7 +320,7 @@ export function buildExternalProxyDownloadCandidates(
       index,
       id: spec.id,
       label: spec.label,
-      url: spec.buildUrl(targetUrl),
+      url: spec.buildUrl(normalizedUrl),
     });
   }
   return out;
@@ -280,20 +332,144 @@ export function buildExternalProxyDownloadCandidates(
 
 type LocalProxyStatus = 'unknown' | 'available' | 'unavailable';
 
+const PROXY_PREF_STORAGE_KEY = 'zxart_proxy_pref_v1';
+const STATIC_MODE_SESSION_KEY = 'zxart_static_mode_v1';
+const STATIC_MODE_TTL_MS = 3 * 60 * 1000;
+const RATE_LIMIT_COOLDOWN_MS = 60_000;
+const TRANSIENT_COOLDOWN_MS = 18_000;
+
 let localProxyStatus: LocalProxyStatus = 'unknown';
+let localProxyProbePromise: Promise<boolean> | null = null;
 let preferredExternalProxyIndex = 0;
+let stateHydrated = false;
+const PROXY_COOLDOWN_UNTIL = new Map<string, number>();
+
 const DOWNLOADED_FILE_CACHE = new Map<string, Uint8Array>();
 const MAX_CACHED_DOWNLOAD_ENTRIES = 8;
 const MAX_CACHED_DOWNLOAD_ITEM_BYTES = 2 * 1024 * 1024;
 
+function getSafeStorage(kind: 'localStorage' | 'sessionStorage'): Storage | null {
+  try {
+    if (typeof window !== 'undefined' && window[kind]) {
+      return window[kind];
+    }
+  } catch {
+    // Ignore restricted storage access
+  }
+  return null;
+}
+
+function hydrateProxyStateOnce(): void {
+  if (stateHydrated) return;
+  stateHydrated = true;
+
+  const ls = getSafeStorage('localStorage');
+  if (ls) {
+    try {
+      const savedId = ls.getItem(PROXY_PREF_STORAGE_KEY);
+      if (savedId) {
+        const idx = EXTERNAL_CORS_PROXIES.findIndex((p) => p.id === savedId);
+        if (idx >= 0) {
+          preferredExternalProxyIndex = idx;
+        }
+      }
+    } catch {
+      // Ignore storage read errors
+    }
+  }
+
+  const ss = getSafeStorage('sessionStorage');
+  if (ss && localProxyStatus === 'unknown') {
+    try {
+      const raw = ss.getItem(STATIC_MODE_SESSION_KEY);
+      if (raw) {
+        const ts = Number(raw);
+        if (Number.isFinite(ts) && Date.now() - ts < STATIC_MODE_TTL_MS) {
+          localProxyStatus = 'unavailable';
+        } else {
+          ss.removeItem(STATIC_MODE_SESSION_KEY);
+        }
+      }
+    } catch {
+      // Ignore storage read errors
+    }
+  }
+}
+
+function markLocalProxyUnavailable(): void {
+  localProxyStatus = 'unavailable';
+  const ss = getSafeStorage('sessionStorage');
+  if (ss) {
+    try {
+      ss.setItem(STATIC_MODE_SESSION_KEY, String(Date.now()));
+    } catch {
+      // Ignore quota errors
+    }
+  }
+}
+
+function markLocalProxyAvailable(): void {
+  localProxyStatus = 'available';
+  const ss = getSafeStorage('sessionStorage');
+  if (ss) {
+    try {
+      ss.removeItem(STATIC_MODE_SESSION_KEY);
+    } catch {
+      // Ignore storage errors
+    }
+  }
+}
+
+function rememberPreferredProxy(index: number, id: string): void {
+  preferredExternalProxyIndex = index;
+  PROXY_COOLDOWN_UNTIL.delete(id);
+  const ls = getSafeStorage('localStorage');
+  if (ls) {
+    try {
+      ls.setItem(PROXY_PREF_STORAGE_KEY, id);
+    } catch {
+      // Ignore quota errors
+    }
+  }
+}
+
+function markProxyCooldown(id: string, status: number): void {
+  const duration =
+    status === 429 || status === 401 || status === 403
+      ? RATE_LIMIT_COOLDOWN_MS
+      : TRANSIENT_COOLDOWN_MS;
+  PROXY_COOLDOWN_UNTIL.set(id, Date.now() + duration);
+}
+
 export function getLocalProxyStatus(): LocalProxyStatus {
+  hydrateProxyStateOnce();
   return localProxyStatus;
 }
 
 export function resetProxyDiscoveryForTests(): void {
   localProxyStatus = 'unknown';
+  localProxyProbePromise = null;
   preferredExternalProxyIndex = 0;
+  stateHydrated = false;
+  PROXY_COOLDOWN_UNTIL.clear();
   DOWNLOADED_FILE_CACHE.clear();
+
+  const ls = getSafeStorage('localStorage');
+  if (ls) {
+    try {
+      ls.removeItem(PROXY_PREF_STORAGE_KEY);
+    } catch {
+      // Ignore
+    }
+  }
+  const ss = getSafeStorage('sessionStorage');
+  if (ss) {
+    try {
+      ss.removeItem(STATIC_MODE_SESSION_KEY);
+    } catch {
+      // Ignore
+    }
+  }
 }
 
 function combineAbortSignals(
@@ -323,43 +499,162 @@ function combineAbortSignals(
   };
 }
 
-async function fetchJsonDirect(url: string, signal?: AbortSignal): Promise<unknown> {
-  const res = await fetch(url, { signal });
-  if (!res.ok) {
-    throw new Error(`ZX-Art API HTTP ${res.status}`);
+function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  if (signal?.aborted) {
+    return Promise.reject(new DOMException('Aborted', 'AbortError'));
   }
-  return res.json();
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      globalThis.clearTimeout(timer);
+      reject(new DOMException('Aborted', 'AbortError'));
+    };
+    const timer = globalThis.setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+const DIRECT_API_TIMEOUT_MS = 9_500;
+const LOCAL_PROXY_TIMEOUT_MS = 3_000;
+
+async function fetchJsonViaSingleAttempt(
+  url: string,
+  timeoutMs: number,
+  signal?: AbortSignal
+): Promise<unknown> {
+  const { signal: attemptSignal, cleanup } = combineAbortSignals(signal, timeoutMs);
+  try {
+    const res = await fetch(url, {
+      signal: attemptSignal,
+      referrerPolicy: 'no-referrer',
+      credentials: 'omit',
+    });
+    if (!res.ok) {
+      throw new Error(`ZX-Art API HTTP ${res.status}`);
+    }
+    return await res.json();
+  } finally {
+    cleanup();
+  }
+}
+
+async function fetchJsonDirect(url: string, signal?: AbortSignal): Promise<unknown> {
+  let lastErr: unknown;
+
+  // Try direct CORS-enabled ZX-Art API (plus 1 quick retry on transient blips)
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+    try {
+      return await fetchJsonViaSingleAttempt(url, DIRECT_API_TIMEOUT_MS, signal);
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      lastErr = err;
+      if (attempt === 0) {
+        await sleepAbortable(250, signal);
+      }
+    }
+  }
+
+  // Last-resort JSON fallback through healthy external CORS proxies if direct zxart.ee fails
+  const now = Date.now();
+  const proxySpecs = selectOrderedProxyCandidates(
+    EXTERNAL_CORS_PROXIES.map((spec, index) => ({
+      index,
+      id: spec.id,
+      label: spec.label,
+      url: spec.buildUrl(url),
+    })),
+    now
+  );
+
+  for (let i = 0; i < Math.min(3, proxySpecs.length); i++) {
+    if (signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+    const spec = proxySpecs[i];
+    try {
+      const json = await fetchJsonViaSingleAttempt(spec.url, 6_500, signal);
+      if (json && typeof json === 'object' && 'responseData' in (json as Record<string, unknown>)) {
+        rememberPreferredProxy(spec.index, spec.id);
+        return json;
+      }
+    } catch (err) {
+      if (signal?.aborted) throw err;
+    }
+  }
+
+  throw lastErr instanceof Error ? lastErr : new Error('Не удалось загрузить данные с zxart.ee');
 }
 
 async function fetchLocalProxyJson<T>(localUrl: string, signal?: AbortSignal): Promise<T | null> {
+  hydrateProxyStateOnce();
   if (localProxyStatus === 'unavailable') return null;
 
-  try {
-    const res = await fetch(localUrl, { signal });
-    if (res.status === 404 || res.status === 405 || res.status === 501) {
-      localProxyStatus = 'unavailable';
-      return null;
-    }
-
-    const ct = res.headers.get('content-type');
-    if (!isJsonContentType(ct)) {
-      // Static hosts with SPA fallback often return 200 text/html for /api/* paths
-      localProxyStatus = 'unavailable';
-      return null;
-    }
-
-    localProxyStatus = 'available';
-    if (!res.ok) {
-      const errBody = (await res.json().catch(() => ({}))) as { error?: string };
-      throw new Error(errBody.error || `Ошибка сервера (${res.status})`);
-    }
-    return (await res.json()) as T;
-  } catch (err) {
-    if (signal?.aborted) throw err;
-    if (localProxyStatus === 'available') throw err;
-    localProxyStatus = 'unavailable';
-    return null;
+  // Avoid firing redundant simultaneous /api/zxart/* probes on initial page load
+  if (localProxyStatus === 'unknown' && localProxyProbePromise) {
+    const hasBackend = await localProxyProbePromise;
+    if (!hasBackend) return null;
   }
+
+  const runProbe = async (): Promise<{ ok: boolean; value: T | null }> => {
+    const { signal: attemptSignal, cleanup } = combineAbortSignals(signal, LOCAL_PROXY_TIMEOUT_MS);
+    try {
+      const res = await fetch(localUrl, { signal: attemptSignal });
+      if (res.status === 404 || res.status === 405 || res.status === 501) {
+        markLocalProxyUnavailable();
+        return { ok: false, value: null };
+      }
+
+      const ct = res.headers.get('content-type');
+      if (!isJsonContentType(ct)) {
+        // Static hosts with SPA fallback often return 200 text/html for /api/* paths
+        markLocalProxyUnavailable();
+        return { ok: false, value: null };
+      }
+
+      markLocalProxyAvailable();
+      if (!res.ok) {
+        const errBody = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(errBody.error || `Ошибка сервера (${res.status})`);
+      }
+      return { ok: true, value: (await res.json()) as T };
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      if (localProxyStatus === 'available') throw err;
+      markLocalProxyUnavailable();
+      return { ok: false, value: null };
+    } finally {
+      cleanup();
+    }
+  };
+
+  if (localProxyStatus === 'unknown') {
+    let settleProbe!: (available: boolean) => void;
+    const gate = new Promise<boolean>((resolve) => {
+      settleProbe = resolve;
+    });
+    localProxyProbePromise = gate;
+    try {
+      const result = await runProbe();
+      settleProbe(result.ok);
+      return result.value;
+    } catch (err) {
+      settleProbe(getLocalProxyStatus() === 'available');
+      throw err;
+    } finally {
+      if (localProxyProbePromise === gate) {
+        localProxyProbePromise = null;
+      }
+    }
+  }
+
+  const result = await runProbe();
+  return result.value;
 }
 
 export async function fetchZxArtCategoriesSmart(signal?: AbortSignal): Promise<ZxArtCategory[]> {
@@ -563,7 +858,38 @@ export async function fetchZxArtReleasesSmart(
 }
 
 const MAX_EXTERNAL_FILE_BYTES = 25 * 1024 * 1024;
-const EXTERNAL_PROXY_TIMEOUT_MS = 8_500;
+const EXTERNAL_PROXY_TIMEOUT_MS = 7_500;
+const HEDGE_STAGGER_MS = 1_400;
+const MAX_CONCURRENT_HEDGES = 3;
+
+class OversizeDownloadError extends Error {
+  constructor() {
+    super('Файл слишком большой для загрузки');
+  }
+}
+
+function selectOrderedProxyCandidates<T extends { id: string }>(
+  candidates: readonly T[],
+  nowMs: number,
+  ignoreCooldowns = false
+): T[] {
+  if (ignoreCooldowns || PROXY_COOLDOWN_UNTIL.size === 0) {
+    return [...candidates];
+  }
+  const healthy: T[] = [];
+  const cooling: T[] = [];
+  for (let i = 0; i < candidates.length; i++) {
+    const item = candidates[i];
+    const until = PROXY_COOLDOWN_UNTIL.get(item.id) ?? 0;
+    if (until > nowMs) {
+      cooling.push(item);
+    } else {
+      if (until !== 0) PROXY_COOLDOWN_UNTIL.delete(item.id);
+      healthy.push(item);
+    }
+  }
+  return [...healthy, ...cooling];
+}
 
 function cacheDownloadedFile(fileUrl: string, bytes: Uint8Array): void {
   if (bytes.byteLength === 0 || bytes.byteLength > MAX_CACHED_DOWNLOAD_ITEM_BYTES) return;
@@ -576,6 +902,171 @@ function cacheDownloadedFile(fileUrl: string, bytes: Uint8Array): void {
   DOWNLOADED_FILE_CACHE.set(fileUrl, bytes);
 }
 
+interface HedgeWaveResult {
+  bytes: Uint8Array | null;
+  lastStatus: number;
+  oversize: boolean;
+}
+
+/**
+ * Races external CORS proxies with staggered hedging:
+ * starts the healthiest proxy first (zero redundant bandwidth if fast),
+ * overlaps backups after HEDGE_STAGGER_MS or immediately on error,
+ * and aborts losing in-flight requests as soon as valid binary bytes arrive.
+ */
+async function downloadViaHedgedProxyWave(
+  targetUrl: string,
+  ignoreCooldowns: boolean,
+  signal?: AbortSignal
+): Promise<HedgeWaveResult> {
+  const rawCandidates = buildExternalProxyDownloadCandidates(targetUrl, preferredExternalProxyIndex);
+  const queue = selectOrderedProxyCandidates(rawCandidates, Date.now(), ignoreCooldowns);
+  if (queue.length === 0) {
+    return { bytes: null, lastStatus: 0, oversize: false };
+  }
+
+  return new Promise<HedgeWaveResult>((resolve, reject) => {
+    let nextQueueIdx = 0;
+    let inFlight = 0;
+    let settled = false;
+    let lastStatus = 0;
+    let hedgeTimer: ReturnType<typeof setTimeout> | null = null;
+    const activeControllers = new Set<AbortController>();
+
+    const cleanupAll = () => {
+      if (hedgeTimer !== null) {
+        globalThis.clearTimeout(hedgeTimer);
+        hedgeTimer = null;
+      }
+      if (signal) {
+        signal.removeEventListener('abort', onParentAbort);
+      }
+      for (const ctrl of activeControllers) {
+        ctrl.abort();
+      }
+      activeControllers.clear();
+    };
+
+    const onParentAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanupAll();
+      reject(new DOMException('Aborted', 'AbortError'));
+    };
+
+    if (signal) {
+      if (signal.aborted) {
+        reject(new DOMException('Aborted', 'AbortError'));
+        return;
+      }
+      signal.addEventListener('abort', onParentAbort, { once: true });
+    }
+
+    const scheduleHedge = () => {
+      if (hedgeTimer !== null) {
+        globalThis.clearTimeout(hedgeTimer);
+        hedgeTimer = null;
+      }
+      if (settled || nextQueueIdx >= queue.length || inFlight >= MAX_CONCURRENT_HEDGES) {
+        return;
+      }
+      hedgeTimer = globalThis.setTimeout(() => {
+        hedgeTimer = null;
+        if (!settled && nextQueueIdx < queue.length && inFlight < MAX_CONCURRENT_HEDGES) {
+          launchNext();
+        }
+      }, HEDGE_STAGGER_MS);
+    };
+
+    const checkExhausted = () => {
+      if (!settled && inFlight === 0 && nextQueueIdx >= queue.length) {
+        settled = true;
+        cleanupAll();
+        resolve({ bytes: null, lastStatus, oversize: false });
+      }
+    };
+
+    const launchNext = () => {
+      if (settled || nextQueueIdx >= queue.length) return;
+      const candidate = queue[nextQueueIdx++];
+      inFlight++;
+
+      const ctrl = new AbortController();
+      activeControllers.add(ctrl);
+      const timeoutId = globalThis.setTimeout(
+        () => ctrl.abort(new Error('timeout')),
+        EXTERNAL_PROXY_TIMEOUT_MS
+      );
+
+      scheduleHedge();
+
+      (async () => {
+        try {
+          const res = await fetch(candidate.url, {
+            signal: ctrl.signal,
+            referrerPolicy: 'no-referrer',
+            credentials: 'omit',
+          });
+          if (!res.ok) {
+            lastStatus = res.status;
+            markProxyCooldown(candidate.id, res.status);
+            return;
+          }
+
+          const contentLen = Number(res.headers.get('content-length') ?? 0);
+          if (contentLen > MAX_EXTERNAL_FILE_BYTES) {
+            throw new OversizeDownloadError();
+          }
+
+          const ct = res.headers.get('content-type');
+          const buf = new Uint8Array(await res.arrayBuffer());
+          if (buf.byteLength > MAX_EXTERNAL_FILE_BYTES) {
+            throw new OversizeDownloadError();
+          }
+          if (isHtmlOrJsonErrorPayload(buf, ct)) {
+            markProxyCooldown(candidate.id, 502);
+            return;
+          }
+
+          if (!settled) {
+            settled = true;
+            rememberPreferredProxy(candidate.index, candidate.id);
+            cleanupAll();
+            resolve({ bytes: buf, lastStatus: 200, oversize: false });
+          }
+        } catch (err) {
+          if (err instanceof OversizeDownloadError) {
+            if (!settled) {
+              settled = true;
+              cleanupAll();
+              resolve({ bytes: null, lastStatus, oversize: true });
+            }
+            return;
+          }
+          if (!settled && !signal?.aborted) {
+            markProxyCooldown(candidate.id, 0);
+          }
+        } finally {
+          globalThis.clearTimeout(timeoutId);
+          activeControllers.delete(ctrl);
+          inFlight--;
+          if (!settled) {
+            if (nextQueueIdx < queue.length && inFlight === 0) {
+              launchNext();
+            } else if (nextQueueIdx < queue.length) {
+              scheduleHedge();
+            } else {
+              checkExhausted();
+            }
+          }
+        }
+      })();
+    };
+
+    launchNext();
+  });
+}
+
 export async function downloadZxArtFileSmart(
   fileUrl: string,
   signal?: AbortSignal
@@ -583,6 +1074,8 @@ export async function downloadZxArtFileSmart(
   if (!isAllowedZxArtDownloadUrl(fileUrl)) {
     throw new Error('Недопустимый URL файла ZX-Art');
   }
+
+  hydrateProxyStateOnce();
 
   const cached = DOWNLOADED_FILE_CACHE.get(fileUrl);
   if (cached) {
@@ -592,85 +1085,64 @@ export async function downloadZxArtFileSmart(
     return cached;
   }
 
+  const normalizedUrl = normalizeZxArtDownloadUrl(fileUrl);
+
   // 1. Prefer same-origin backend proxy when available (fast, no rate limits)
   if (localProxyStatus !== 'unavailable') {
     try {
       const localRes = await fetch(
-        `api/zxart/download?url=${encodeURIComponent(fileUrl)}`,
+        `api/zxart/download?url=${encodeURIComponent(normalizedUrl)}`,
         { signal }
       );
       const ct = localRes.headers.get('content-type');
       const isStaticSpaHtml = ct !== null && ct.toLowerCase().includes('text/html');
 
       if (localRes.status === 404 || localRes.status === 405 || localRes.status === 501 || isStaticSpaHtml) {
-        localProxyStatus = 'unavailable';
+        markLocalProxyUnavailable();
       } else if (!localRes.ok) {
-        localProxyStatus = 'available';
+        markLocalProxyAvailable();
         const errBody = (await localRes.json().catch(() => ({}))) as { error?: string };
         throw new Error(errBody.error || `Ошибка загрузки файла (${localRes.status})`);
       } else {
         const buf = new Uint8Array(await localRes.arrayBuffer());
         if (!isHtmlOrJsonErrorPayload(buf, ct)) {
-          localProxyStatus = 'available';
+          markLocalProxyAvailable();
           cacheDownloadedFile(fileUrl, buf);
           return buf;
         }
-        localProxyStatus = 'unavailable';
+        markLocalProxyUnavailable();
       }
     } catch (err) {
       if (signal?.aborted) throw err;
       if (localProxyStatus === 'available') throw err;
-      localProxyStatus = 'unavailable';
+      markLocalProxyUnavailable();
     }
   }
 
-  // 2. Fallback for static sites: try free keyless binary-safe external CORS proxies
-  const candidates = buildExternalProxyDownloadCandidates(fileUrl, preferredExternalProxyIndex);
-  let lastStatus = 0;
-
-  for (let i = 0; i < candidates.length; i++) {
-    if (signal?.aborted) {
-      throw new DOMException('Aborted', 'AbortError');
-    }
-
-    const candidate = candidates[i];
-    const { signal: attemptSignal, cleanup } = combineAbortSignals(signal, EXTERNAL_PROXY_TIMEOUT_MS);
-    try {
-      const res = await fetch(candidate.url, { signal: attemptSignal });
-      if (!res.ok) {
-        lastStatus = res.status;
-        continue;
-      }
-
-      const contentLen = Number(res.headers.get('content-length') ?? 0);
-      if (contentLen > MAX_EXTERNAL_FILE_BYTES) {
-        throw new Error('Файл слишком большой для загрузки');
-      }
-
-      const ct = res.headers.get('content-type');
-      const buf = new Uint8Array(await res.arrayBuffer());
-      if (buf.byteLength > MAX_EXTERNAL_FILE_BYTES) {
-        throw new Error('Файл слишком большой для загрузки');
-      }
-      if (isHtmlOrJsonErrorPayload(buf, ct)) {
-        continue;
-      }
-
-      preferredExternalProxyIndex = candidate.index;
-      cacheDownloadedFile(fileUrl, buf);
-      return buf;
-    } catch (err) {
-      if (signal?.aborted) throw err;
-      if (err instanceof Error && err.message === 'Файл слишком большой для загрузки') {
-        throw err;
-      }
-      // Try next proxy candidate
-    } finally {
-      cleanup();
-    }
+  // 2. Fallback for static sites: hedged proxy racing + canonical URL & retry wave
+  const wave1 = await downloadViaHedgedProxyWave(normalizedUrl, false, signal);
+  if (wave1.oversize) {
+    throw new Error('Файл слишком большой для загрузки');
+  }
+  if (wave1.bytes) {
+    cacheDownloadedFile(fileUrl, wave1.bytes);
+    return wave1.bytes;
   }
 
-  if (lastStatus === 429) {
+  // Brief backoff before Wave 2 (tries canonical id:<id>/ URL if filename has special chars, or retries all proxies)
+  await sleepAbortable(350, signal);
+  const canonicalUrl = buildCanonicalZxArtDownloadUrl(normalizedUrl);
+  const wave2 = await downloadViaHedgedProxyWave(canonicalUrl ?? normalizedUrl, true, signal);
+  if (wave2.oversize) {
+    throw new Error('Файл слишком большой для загрузки');
+  }
+  if (wave2.bytes) {
+    cacheDownloadedFile(fileUrl, wave2.bytes);
+    return wave2.bytes;
+  }
+
+  const finalStatus = wave2.lastStatus || wave1.lastStatus;
+  if (finalStatus === 429) {
     throw new Error(
       'Бесплатные публичные CORS-прокси временно ограничили частоту запросов (HTTP 429). Нажмите «Скачать» или попробуйте через минуту.'
     );

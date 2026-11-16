@@ -50,6 +50,7 @@ import {
   fetchZxArtGamesSmart,
   fetchZxArtReleasesSmart,
   getLocalProxyStatus,
+  normalizeZxArtDownloadUrl,
 } from '../emulator/zxartDirectApi';
 import {
   ExtractedEntry,
@@ -922,7 +923,7 @@ export const ZxArtCatalog: React.FC<ZxArtCatalogProps> = ({
         // On static hosting, trigger direct browser download without consuming external CORS proxy quota
         if (getLocalProxyStatus() === 'unavailable') {
           const link = document.createElement('a');
-          link.href = rel.fileUrl;
+          link.href = normalizeZxArtDownloadUrl(rel.fileUrl);
           link.download = rel.fileName;
           link.rel = 'noopener noreferrer';
           link.style.display = 'none';
