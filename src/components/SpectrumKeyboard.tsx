@@ -557,11 +557,21 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
   }, []);
 
   const releasePointerById = useCallback(
-    (pointerId: number) => {
-      const hadSlide = shiftSlidePointersRef.current.delete(pointerId);
-      if (!activePointers.current.has(pointerId) && !hadSlide) return;
-      activePointers.current.delete(pointerId);
-      keyboard.releaseVirtualButton(pointerId);
+    (pointerId: number, commitSlide = false) => {
+      const slide = shiftSlidePointersRef.current.get(pointerId);
+      const hadSlide = slide !== undefined;
+      if (hadSlide) {
+        shiftSlidePointersRef.current.delete(pointerId);
+      }
+      const hadPointer = activePointers.current.delete(pointerId);
+      if (!hadPointer && !hadSlide) return;
+
+      if (commitSlide && slide && slide.targetKeyId !== null) {
+        triggerHaptic(11);
+        keyboard.commitVirtualShiftSlide(pointerId, slide.shiftId, slide.targetKeyId);
+      } else {
+        keyboard.releaseVirtualButton(pointerId);
+      }
       syncPressedState();
     },
     [keyboard, syncPressedState]
@@ -656,7 +666,6 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
           const nextTarget = hitId !== null && hitId !== slideState.shiftId ? hitId : null;
           if (slideState.targetKeyId !== nextTarget) {
             slideState.targetKeyId = nextTarget;
-            keyboard.setVirtualShiftSlideTarget(e.pointerId, nextTarget);
             if (nextTarget !== null) {
               triggerHaptic(8);
             }
@@ -666,8 +675,9 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
       }
     };
     const onWindowPointerUp = (e: PointerEvent) => {
-      if (activePointers.current.has(e.pointerId)) {
-        releasePointerById(e.pointerId);
+      const commitSlide = e.type === 'pointerup';
+      if (activePointers.current.has(e.pointerId) || shiftSlidePointersRef.current.has(e.pointerId)) {
+        releasePointerById(e.pointerId, commitSlide);
       }
       if (stickPointerIdRef.current === e.pointerId) {
         resetStick();
@@ -808,7 +818,7 @@ export const SpectrumKeyboard: React.FC<SpectrumKeyboardProps> = React.memo(({
   const releaseVirtualButton = useCallback(
     (e: React.PointerEvent<HTMLButtonElement>) => {
       e.preventDefault();
-      releasePointerById(e.pointerId);
+      releasePointerById(e.pointerId, e.type === 'pointerup');
     },
     [releasePointerById]
   );

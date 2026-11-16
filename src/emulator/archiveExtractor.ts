@@ -141,6 +141,22 @@ function isIgnoredArchivePath(path: string): boolean {
   return false;
 }
 
+/**
+ * Returns true only for entries inside a ZIP archive that can yield playable
+ * ZX Spectrum media, Hobeta files, or nested archives.
+ * Used both as a filter in fflate.unzipSync and for HTTP Range selective fetching.
+ */
+export function shouldUnzipEntry(path: string): boolean {
+  if (!path || path.endsWith('/')) return false;
+  if (isIgnoredArchivePath(path)) return false;
+  const cleanPath = path.replace(/\\/g, '/').replace(/^\/+/, '');
+  const baseName = cleanPath.split('/').pop() || cleanPath;
+  if (!baseName) return false;
+  if (isArchiveFile(baseName)) return true;
+  const ext = getFileExtension(baseName);
+  return isPlayableGameExtension(ext);
+}
+
 function stripCompressionExt(filename: string): string {
   const base = filename.split(/[\\/]/).pop() || filename;
   const lower = base.toLowerCase();
@@ -829,7 +845,9 @@ async function unpackSingleArchiveLayer(
 
   if (ext === 'zip') {
     try {
-      const files = unzipSync(bytes);
+      const files = unzipSync(bytes, {
+        filter: (file) => shouldUnzipEntry(file.name),
+      });
       const result: Array<{ path: string; bytes: Uint8Array }> = [];
       for (const [path, data] of Object.entries(files)) {
         if (path.endsWith('/') || data.length === 0) continue;

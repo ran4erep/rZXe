@@ -15,6 +15,7 @@ import {
   type ZxArtPlayableRelease,
   type ZxArtSortOrder,
 } from './zxartCatalog';
+import { shouldUnzipEntry } from './archiveExtractor';
 
 export const ZXART_DIRECT_API_BASE = 'https://zxart.ee/api';
 
@@ -690,16 +691,15 @@ export async function fetchZxArtReleasesSmart(
   return parseZxArtReleasesResponse(rawJson);
 }
 
-const MAX_EXTERNAL_FILE_BYTES = 25 * 1024 * 1024;
-const EXTERNAL_PROXY_TIMEOUT_MS = 12_000;
+const EXTERNAL_PROXY_HEADER_TIMEOUT_MS = 12_000;
+const STREAM_STALL_TIMEOUT_MS = 15_000;
+const ZIP_SELECTIVE_RANGE_MIN_BYTES = 4 * 1024 * 1024;
+const ZIP_RANGE_COALESCE_GAP_BYTES = 64 * 1024;
+const ZIP_RANGE_MAX_SPAN_BYTES = 8 * 1024 * 1024;
 const HEDGE_STAGGER_MS = 700;
 const MAX_CONCURRENT_HEDGES = 3;
 
-class OversizeDownloadError extends Error {
-  constructor() {
-    super('Файл слишком большой для загрузки');
-  }
-}
+const ZIP_UTF8_DECODER = new TextDecoder('utf-8', { fatal: false });
 
 function selectOrderedProxyCandidates<T extends { id: string }>(
   candidates: readonly T[],
@@ -735,27 +735,555 @@ function cacheDownloadedFile(fileUrl: string, bytes: Uint8Array): void {
   DOWNLOADED_FILE_CACHE.set(fileUrl, bytes);
 }
 
+function concatUint8Chunks(chunks: readonly Uint8Array[], totalBytes: number): Uint8Array {
+  if (chunks.length === 1 && chunks[0].byteLength === totalBytes) {
+    return chunks[0];
+  }
+  const out = new Uint8Array(totalBytes);
+  let pos = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    const c = chunks[i];
+    out.set(c, pos);
+    pos += c.byteLength;
+  }
+  return out;
+}
+
+class HtmlOrJsonProxyError extends Error {
+  constructor() {
+    super('Proxy returned HTML/JSON error payload');
+  }
+}
+
+class LargeZipRangeSwitchSignal extends Error {
+  constructor(
+    public readonly totalBytes: number,
+    public readonly firstChunk: Uint8Array
+  ) {
+    super('Large ZIP detected for selective range fetch');
+  }
+}
+
+async function readResponseStreamWithWatchdog(
+  res: Response,
+  ctrl: AbortController,
+  contentType: string | null,
+  options: {
+    stallTimeoutMs: number;
+    detectLargeZip: boolean;
+    onValidFirstChunk?: () => void;
+  }
+): Promise<Uint8Array> {
+  const hasContentEncoding = Boolean(res.headers.get('content-encoding'));
+  const rawContentLen = Number(res.headers.get('content-length') ?? 0);
+  const expectedLen =
+    !hasContentEncoding && Number.isFinite(rawContentLen) && rawContentLen > 0
+      ? Math.floor(rawContentLen)
+      : 0;
+
+  if (!res.body) {
+    const buf = new Uint8Array(await res.arrayBuffer());
+    if (isHtmlOrJsonErrorPayload(buf, contentType)) {
+      throw new HtmlOrJsonProxyError();
+    }
+    options.onValidFirstChunk?.();
+    return buf;
+  }
+
+  const reader = res.body.getReader();
+  let stallTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const armStallTimer = () => {
+    if (stallTimer !== null) globalThis.clearTimeout(stallTimer);
+    stallTimer = globalThis.setTimeout(
+      () => ctrl.abort(new Error('stream stall timeout')),
+      options.stallTimeoutMs
+    );
+  };
+
+  let prealloc: Uint8Array | null = null;
+  if (expectedLen > 0) {
+    try {
+      prealloc = new Uint8Array(expectedLen);
+    } catch {
+      prealloc = null;
+    }
+  }
+  const chunks: Uint8Array[] = [];
+  let totalRead = 0;
+  let validatedFirstChunk = false;
+
+  try {
+    armStallTimer();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      armStallTimer();
+      if (!value || value.byteLength === 0) continue;
+
+      if (!validatedFirstChunk) {
+        validatedFirstChunk = true;
+        if (isHtmlOrJsonErrorPayload(value, contentType)) {
+          try {
+            await reader.cancel();
+          } catch {
+            // Ignore cancel errors
+          }
+          throw new HtmlOrJsonProxyError();
+        }
+        if (
+          options.detectLargeZip &&
+          expectedLen > ZIP_SELECTIVE_RANGE_MIN_BYTES &&
+          value.byteLength >= 4 &&
+          value[0] === 0x50 &&
+          value[1] === 0x4b &&
+          value[2] === 0x03 &&
+          value[3] === 0x04
+        ) {
+          try {
+            await reader.cancel();
+          } catch {
+            // Ignore cancel errors
+          }
+          throw new LargeZipRangeSwitchSignal(expectedLen, value);
+        }
+        options.onValidFirstChunk?.();
+      }
+
+      if (prealloc !== null) {
+        if (totalRead + value.byteLength <= prealloc.byteLength) {
+          prealloc.set(value, totalRead);
+          totalRead += value.byteLength;
+          continue;
+        }
+        // Fallback if actual decompressed bytes exceed compressed Content-Length
+        if (totalRead > 0) {
+          chunks.push(prealloc.slice(0, totalRead));
+        }
+        prealloc = null;
+      }
+
+      chunks.push(value);
+      totalRead += value.byteLength;
+    }
+
+    if (!validatedFirstChunk) {
+      throw new HtmlOrJsonProxyError();
+    }
+
+    if (prealloc !== null) {
+      return totalRead === prealloc.byteLength ? prealloc : prealloc.subarray(0, totalRead);
+    }
+    return concatUint8Chunks(chunks, totalRead);
+  } finally {
+    if (stallTimer !== null) {
+      globalThis.clearTimeout(stallTimer);
+      stallTimer = null;
+    }
+    try {
+      reader.releaseLock();
+    } catch {
+      // Ignore release errors
+    }
+  }
+}
+
+interface ParsedZipEocd {
+  cdSize: number;
+  cdOffset: number;
+  totalEntries: number;
+}
+
+function parseZipEocdFromTail(tail: Uint8Array): ParsedZipEocd | null {
+  if (tail.byteLength < 22) return null;
+  const dv = new DataView(tail.buffer, tail.byteOffset, tail.byteLength);
+  const minOffset = Math.max(0, tail.byteLength - 65558);
+  for (let i = tail.byteLength - 22; i >= minOffset; i--) {
+    if (dv.getUint32(i, true) !== 0x06054b50) continue;
+    const commentLen = dv.getUint16(i + 20, true);
+    if (i + 22 + commentLen > tail.byteLength) continue;
+    const diskNum = dv.getUint16(i + 4, true);
+    const cdStartDisk = dv.getUint16(i + 6, true);
+    const diskEntries = dv.getUint16(i + 8, true);
+    const totalEntries = dv.getUint16(i + 10, true);
+    const cdSize = dv.getUint32(i + 12, true);
+    const cdOffset = dv.getUint32(i + 16, true);
+    if (
+      diskNum !== 0 ||
+      cdStartDisk !== 0 ||
+      diskEntries !== totalEntries ||
+      totalEntries === 0xffff ||
+      cdSize === 0xffffffff ||
+      cdOffset === 0xffffffff
+    ) {
+      return null;
+    }
+    return { cdSize, cdOffset, totalEntries };
+  }
+  return null;
+}
+
+interface ZipCdEntry {
+  name: string;
+  flags: number;
+  crc32: number;
+  compSize: number;
+  uncompSize: number;
+  lfhOffset: number;
+  lfhEndExclusive: number;
+  cdRaw: Uint8Array;
+}
+
+function parseZipCentralDirectory(
+  cd: Uint8Array,
+  cdOffset: number
+): ZipCdEntry[] | null {
+  const dv = new DataView(cd.buffer, cd.byteOffset, cd.byteLength);
+  const entries: ZipCdEntry[] = [];
+  let pos = 0;
+
+  while (pos + 46 <= cd.byteLength) {
+    if (dv.getUint32(pos, true) !== 0x02014b50) {
+      return null;
+    }
+    const flags = dv.getUint16(pos + 8, true);
+    const crc32 = dv.getUint32(pos + 16, true);
+    const compSize = dv.getUint32(pos + 20, true);
+    const uncompSize = dv.getUint32(pos + 24, true);
+    const nameLen = dv.getUint16(pos + 28, true);
+    const extraLen = dv.getUint16(pos + 30, true);
+    const commentLen = dv.getUint16(pos + 32, true);
+    const diskStart = dv.getUint16(pos + 34, true);
+    const lfhOffset = dv.getUint32(pos + 42, true);
+
+    const recordLen = 46 + nameLen + extraLen + commentLen;
+    if (pos + recordLen > cd.byteLength) return null;
+    if (
+      diskStart !== 0 ||
+      compSize === 0xffffffff ||
+      uncompSize === 0xffffffff ||
+      lfhOffset === 0xffffffff
+    ) {
+      return null;
+    }
+
+    const name = ZIP_UTF8_DECODER.decode(cd.subarray(pos + 46, pos + 46 + nameLen));
+    entries.push({
+      name,
+      flags,
+      crc32,
+      compSize,
+      uncompSize,
+      lfhOffset,
+      lfhEndExclusive: cdOffset,
+      cdRaw: cd.subarray(pos, pos + recordLen),
+    });
+
+    pos += recordLen;
+  }
+
+  if (pos !== cd.byteLength) return null;
+
+  // Sort a copy by lfhOffset so each entry gets its tight byte upper bound in the archive
+  const byOffset = [...entries].sort((a, b) => a.lfhOffset - b.lfhOffset);
+  for (let i = 0; i < byOffset.length; i++) {
+    const cur = byOffset[i];
+    const nextOff = i + 1 < byOffset.length ? byOffset[i + 1].lfhOffset : cdOffset;
+    if (nextOff < cur.lfhOffset) return null;
+    cur.lfhEndExclusive = nextOff;
+  }
+
+  return entries;
+}
+
+interface ByteSpanRequest {
+  start: number;
+  end: number; // inclusive
+  entries: ZipCdEntry[];
+}
+
+function coalesceZipEntrySpans(kept: readonly ZipCdEntry[]): ByteSpanRequest[] {
+  if (kept.length === 0) return [];
+  const sorted = [...kept].sort((a, b) => a.lfhOffset - b.lfhOffset);
+  const spans: ByteSpanRequest[] = [];
+
+  for (let i = 0; i < sorted.length; i++) {
+    const entry = sorted[i];
+    const entryStart = entry.lfhOffset;
+    const entryEnd = Math.max(entryStart, entry.lfhEndExclusive - 1);
+    const prev = spans.length > 0 ? spans[spans.length - 1] : null;
+    if (
+      prev &&
+      entryStart - (prev.end + 1) <= ZIP_RANGE_COALESCE_GAP_BYTES &&
+      entryEnd - prev.start + 1 <= ZIP_RANGE_MAX_SPAN_BYTES
+    ) {
+      prev.end = Math.max(prev.end, entryEnd);
+      prev.entries.push(entry);
+    } else {
+      spans.push({ start: entryStart, end: entryEnd, entries: [entry] });
+    }
+  }
+
+  return spans;
+}
+
+async function fetchProxyByteRange(
+  candidate: { index: number; id: string; url: string },
+  start: number,
+  end: number,
+  signal?: AbortSignal
+): Promise<{ status: number; bytes: Uint8Array | null }> {
+  const expectedLen = end - start + 1;
+  if (expectedLen <= 0) return { status: 0, bytes: null };
+
+  const ctrl = new AbortController();
+  const onParentAbort = () => ctrl.abort(signal?.reason);
+  if (signal) {
+    if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+    signal.addEventListener('abort', onParentAbort, { once: true });
+  }
+  const headerTimer = globalThis.setTimeout(
+    () => ctrl.abort(new Error('range header timeout')),
+    EXTERNAL_PROXY_HEADER_TIMEOUT_MS
+  );
+
+  try {
+    const res = await fetch(candidate.url, {
+      signal: ctrl.signal,
+      headers: { Range: `bytes=${start}-${end}` },
+      referrerPolicy: 'no-referrer',
+      credentials: 'omit',
+    });
+    globalThis.clearTimeout(headerTimer);
+
+    if (res.status !== 206) {
+      try {
+        await res.body?.cancel();
+      } catch {
+        // Ignore cancel errors
+      }
+      if (!res.ok) {
+        markProxyCooldown(candidate.id, res.status);
+      }
+      return { status: res.status, bytes: null };
+    }
+
+    const bytes = await readResponseStreamWithWatchdog(
+      res,
+      ctrl,
+      res.headers.get('content-type'),
+      {
+        stallTimeoutMs: STREAM_STALL_TIMEOUT_MS,
+        detectLargeZip: false,
+      }
+    );
+    if (bytes.byteLength !== expectedLen) {
+      return { status: 206, bytes: null };
+    }
+    return { status: 206, bytes };
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    markProxyCooldown(candidate.id, 0);
+    return { status: 0, bytes: null };
+  } finally {
+    globalThis.clearTimeout(headerTimer);
+    if (signal) signal.removeEventListener('abort', onParentAbort);
+  }
+}
+
+async function tryDownloadSelectiveZipViaRange(
+  totalBytes: number,
+  candidates: readonly { index: number; id: string; label: string; url: string }[],
+  signal?: AbortSignal
+): Promise<Uint8Array | null> {
+  if (totalBytes < 22 || candidates.length === 0) return null;
+
+  // 1) Fetch tail 64KB to locate ZIP End-Of-Central-Directory (EOCD)
+  const tailStart = Math.max(0, totalBytes - 65536);
+  const tailEnd = totalBytes - 1;
+  let workingCandidate: { index: number; id: string; label: string; url: string } | null = null;
+  let tailBytes: Uint8Array | null = null;
+
+  for (let i = 0; i < candidates.length; i++) {
+    const cand = candidates[i];
+    const probe = await fetchProxyByteRange(cand, tailStart, tailEnd, signal);
+    if (probe.status === 206 && probe.bytes) {
+      workingCandidate = cand;
+      tailBytes = probe.bytes;
+      break;
+    }
+  }
+
+  if (!workingCandidate || !tailBytes) return null;
+
+  const eocd = parseZipEocdFromTail(tailBytes);
+  if (
+    !eocd ||
+    eocd.cdSize === 0 ||
+    eocd.cdOffset + eocd.cdSize > totalBytes ||
+    eocd.cdSize > 16 * 1024 * 1024
+  ) {
+    return null;
+  }
+
+  // Helper that fetches a range preferring the verified Range-capable proxy, with backup fallback
+  const fetchRangeReliable = async (start: number, end: number): Promise<Uint8Array | null> => {
+    const primary = await fetchProxyByteRange(workingCandidate!, start, end, signal);
+    if (primary.status === 206 && primary.bytes) return primary.bytes;
+    for (let i = 0; i < candidates.length; i++) {
+      const cand = candidates[i];
+      if (cand.id === workingCandidate!.id) continue;
+      const alt = await fetchProxyByteRange(cand, start, end, signal);
+      if (alt.status === 206 && alt.bytes) {
+        workingCandidate = cand;
+        return alt.bytes;
+      }
+    }
+    return null;
+  };
+
+  // 2) Slice Central Directory from tailBytes if already covered, else fetch via Range
+  let cdBytes: Uint8Array | null = null;
+  if (eocd.cdOffset >= tailStart) {
+    const rel = eocd.cdOffset - tailStart;
+    if (rel + eocd.cdSize <= tailBytes.byteLength) {
+      cdBytes = tailBytes.subarray(rel, rel + eocd.cdSize);
+    }
+  }
+  if (!cdBytes) {
+    cdBytes = await fetchRangeReliable(eocd.cdOffset, eocd.cdOffset + eocd.cdSize - 1);
+  }
+  if (!cdBytes) return null;
+
+  // 3) Parse Central Directory & keep only playable ZX Spectrum / nested-archive entries
+  const allEntries = parseZipCentralDirectory(cdBytes, eocd.cdOffset);
+  if (!allEntries) return null;
+
+  const keptEntries: ZipCdEntry[] = [];
+  let keptTotalSpanBytes = 0;
+  for (let i = 0; i < allEntries.length; i++) {
+    const entry = allEntries[i];
+    if (!shouldUnzipEntry(entry.name)) continue;
+    keptEntries.push(entry);
+    keptTotalSpanBytes += Math.max(0, entry.lfhEndExclusive - entry.lfhOffset);
+  }
+
+  // If ZIP contains zero playable entries, emit a 22-byte empty ZIP immediately
+  // instead of wasting bandwidth on unrelated PC binaries/media.
+  if (keptEntries.length === 0) {
+    const emptyEocd = new Uint8Array(22);
+    new DataView(emptyEocd.buffer).setUint32(0, 0x06054b50, true);
+    rememberPreferredProxy(workingCandidate.index, workingCandidate.id);
+    return emptyEocd;
+  }
+
+  // If kept entries already make up >80% of the archive, a full sequential stream is cheaper
+  if (keptTotalSpanBytes > totalBytes * 0.8) {
+    return null;
+  }
+
+  // 4) Download only the kept spans via coalesced Range requests
+  const spans = coalesceZipEntrySpans(keptEntries);
+  const localChunks: Uint8Array[] = [];
+  const newOffsets: number[] = [];
+  let totalLocalBytes = 0;
+  let totalCdBytes = 0;
+
+  for (let sIdx = 0; sIdx < spans.length; sIdx++) {
+    const span = spans[sIdx];
+    const spanBytes = await fetchRangeReliable(span.start, span.end);
+    if (!spanBytes) return null;
+
+    for (let eIdx = 0; eIdx < span.entries.length; eIdx++) {
+      const entry = span.entries[eIdx];
+      const rel = entry.lfhOffset - span.start;
+      if (rel < 0 || rel + 30 > spanBytes.byteLength) return null;
+
+      const lfhDv = new DataView(spanBytes.buffer, spanBytes.byteOffset + rel, 30);
+      if (lfhDv.getUint32(0, true) !== 0x04034b50) return null;
+      const lfhNameLen = lfhDv.getUint16(26, true);
+      const lfhExtraLen = lfhDv.getUint16(28, true);
+      const localRecordLen = 30 + lfhNameLen + lfhExtraLen + entry.compSize;
+      if (rel + localRecordLen > spanBytes.byteLength) return null;
+
+      // Copy local record so we can normalize Data Descriptor bits cleanly if needed
+      const localRecord = spanBytes.slice(rel, rel + localRecordLen);
+      if ((entry.flags & 0x0008) !== 0) {
+        const recDv = new DataView(localRecord.buffer, localRecord.byteOffset, 30);
+        recDv.setUint16(6, recDv.getUint16(6, true) & ~0x0008, true);
+        recDv.setUint32(14, entry.crc32, true);
+        recDv.setUint32(18, entry.compSize, true);
+        recDv.setUint32(22, entry.uncompSize, true);
+      }
+
+      newOffsets.push(totalLocalBytes);
+      localChunks.push(localRecord);
+      totalLocalBytes += localRecordLen;
+      totalCdBytes += entry.cdRaw.byteLength;
+    }
+  }
+
+  // 5) Reassemble compact valid ZIP containing exclusively the kept Spectrum entries
+  const out = new Uint8Array(totalLocalBytes + totalCdBytes + 22);
+  let writePos = 0;
+  for (let i = 0; i < localChunks.length; i++) {
+    out.set(localChunks[i], writePos);
+    writePos += localChunks[i].byteLength;
+  }
+
+  const cdOutStart = writePos;
+  let flatIdx = 0;
+  for (let sIdx = 0; sIdx < spans.length; sIdx++) {
+    const entries = spans[sIdx].entries;
+    for (let eIdx = 0; eIdx < entries.length; eIdx++) {
+      const entry = entries[eIdx];
+      out.set(entry.cdRaw, writePos);
+      const cdDv = new DataView(out.buffer, writePos, entry.cdRaw.byteLength);
+      if ((entry.flags & 0x0008) !== 0) {
+        cdDv.setUint16(8, entry.flags & ~0x0008, true);
+      }
+      cdDv.setUint32(42, newOffsets[flatIdx++], true);
+      writePos += entry.cdRaw.byteLength;
+    }
+  }
+
+  const eocdDv = new DataView(out.buffer, writePos, 22);
+  eocdDv.setUint32(0, 0x06054b50, true);
+  eocdDv.setUint16(4, 0, true);
+  eocdDv.setUint16(6, 0, true);
+  eocdDv.setUint16(8, keptEntries.length, true);
+  eocdDv.setUint16(10, keptEntries.length, true);
+  eocdDv.setUint32(12, totalCdBytes, true);
+  eocdDv.setUint32(16, cdOutStart, true);
+  eocdDv.setUint16(20, 0, true);
+
+  rememberPreferredProxy(workingCandidate.index, workingCandidate.id);
+  return out;
+}
+
 interface HedgeWaveResult {
   bytes: Uint8Array | null;
   lastStatus: number;
-  oversize: boolean;
+  fallbackToFullStream?: boolean;
 }
 
 /**
  * Races external CORS proxies with staggered hedging:
- * starts the healthiest proxy first (zero redundant bandwidth if fast),
- * overlaps backups after HEDGE_STAGGER_MS or immediately on error,
- * and aborts losing in-flight requests as soon as valid binary bytes arrive.
+ * - starts the healthiest proxy first (zero redundant bandwidth when responsive)
+ * - aborts competing idle/slower full-GET streams once one proxy begins streaming valid bytes
+ * - uses header + per-chunk stall watchdog so multi-megabyte files never fail mid-transfer
+ * - switches large (>4MB) ZIP files to HTTP Range selective entry retrieval when supported
  */
 async function downloadViaHedgedProxyWave(
   targetUrl: string,
   ignoreCooldowns: boolean,
+  skipSelectiveZip: boolean,
   signal?: AbortSignal
 ): Promise<HedgeWaveResult> {
   const rawCandidates = buildExternalProxyDownloadCandidates(targetUrl, preferredExternalProxyIndex);
   const queue = selectOrderedProxyCandidates(rawCandidates, Date.now(), ignoreCooldowns);
   if (queue.length === 0) {
-    return { bytes: null, lastStatus: 0, oversize: false };
+    return { bytes: null, lastStatus: 0 };
   }
 
   return new Promise<HedgeWaveResult>((resolve, reject) => {
@@ -763,14 +1291,20 @@ async function downloadViaHedgedProxyWave(
     let inFlight = 0;
     let settled = false;
     let lastStatus = 0;
+    let selectiveZipAttempted = skipSelectiveZip;
+    let activeStreamWinner: AbortController | null = null;
     let hedgeTimer: ReturnType<typeof setTimeout> | null = null;
     const activeControllers = new Set<AbortController>();
 
-    const cleanupAll = () => {
+    const clearHedgeTimer = () => {
       if (hedgeTimer !== null) {
         globalThis.clearTimeout(hedgeTimer);
         hedgeTimer = null;
       }
+    };
+
+    const cleanupAll = () => {
+      clearHedgeTimer();
       if (signal) {
         signal.removeEventListener('abort', onParentAbort);
       }
@@ -796,16 +1330,23 @@ async function downloadViaHedgedProxyWave(
     }
 
     const scheduleHedge = () => {
-      if (hedgeTimer !== null) {
-        globalThis.clearTimeout(hedgeTimer);
-        hedgeTimer = null;
-      }
-      if (settled || nextQueueIdx >= queue.length || inFlight >= MAX_CONCURRENT_HEDGES) {
+      clearHedgeTimer();
+      if (
+        settled ||
+        activeStreamWinner !== null ||
+        nextQueueIdx >= queue.length ||
+        inFlight >= MAX_CONCURRENT_HEDGES
+      ) {
         return;
       }
       hedgeTimer = globalThis.setTimeout(() => {
         hedgeTimer = null;
-        if (!settled && nextQueueIdx < queue.length && inFlight < MAX_CONCURRENT_HEDGES) {
+        if (
+          !settled &&
+          activeStreamWinner === null &&
+          nextQueueIdx < queue.length &&
+          inFlight < MAX_CONCURRENT_HEDGES
+        ) {
           launchNext();
         }
       }, HEDGE_STAGGER_MS);
@@ -815,7 +1356,18 @@ async function downloadViaHedgedProxyWave(
       if (!settled && inFlight === 0 && nextQueueIdx >= queue.length) {
         settled = true;
         cleanupAll();
-        resolve({ bytes: null, lastStatus, oversize: false });
+        resolve({ bytes: null, lastStatus });
+      }
+    };
+
+    const claimStreamWinner = (winnerCtrl: AbortController) => {
+      if (settled || activeStreamWinner !== null) return;
+      activeStreamWinner = winnerCtrl;
+      clearHedgeTimer();
+      for (const other of activeControllers) {
+        if (other !== winnerCtrl) {
+          other.abort();
+        }
       }
     };
 
@@ -826,9 +1378,9 @@ async function downloadViaHedgedProxyWave(
 
       const ctrl = new AbortController();
       activeControllers.add(ctrl);
-      const timeoutId = globalThis.setTimeout(
-        () => ctrl.abort(new Error('timeout')),
-        EXTERNAL_PROXY_TIMEOUT_MS
+      let headerTimeoutId: ReturnType<typeof setTimeout> | null = globalThis.setTimeout(
+        () => ctrl.abort(new Error('header timeout')),
+        EXTERNAL_PROXY_HEADER_TIMEOUT_MS
       );
 
       scheduleHedge();
@@ -840,53 +1392,107 @@ async function downloadViaHedgedProxyWave(
             referrerPolicy: 'no-referrer',
             credentials: 'omit',
           });
+          if (headerTimeoutId !== null) {
+            globalThis.clearTimeout(headerTimeoutId);
+            headerTimeoutId = null;
+          }
+
           if (!res.ok) {
             lastStatus = res.status;
             markProxyCooldown(candidate.id, res.status);
             return;
           }
 
-          const contentLen = Number(res.headers.get('content-length') ?? 0);
-          if (contentLen > MAX_EXTERNAL_FILE_BYTES) {
-            throw new OversizeDownloadError();
-          }
-
           const ct = res.headers.get('content-type');
-          const buf = new Uint8Array(await res.arrayBuffer());
-          if (buf.byteLength > MAX_EXTERNAL_FILE_BYTES) {
-            throw new OversizeDownloadError();
-          }
-          if (isHtmlOrJsonErrorPayload(buf, ct)) {
+          if (
+            ct &&
+            (ct.toLowerCase().includes('text/html') ||
+              ct.toLowerCase().includes('application/xhtml') ||
+              ct.toLowerCase().includes('application/json'))
+          ) {
+            try {
+              await res.body?.cancel();
+            } catch {
+              // Ignore
+            }
             markProxyCooldown(candidate.id, 502);
             return;
           }
+
+          const buf = await readResponseStreamWithWatchdog(res, ctrl, ct, {
+            stallTimeoutMs: STREAM_STALL_TIMEOUT_MS,
+            detectLargeZip: !selectiveZipAttempted,
+            onValidFirstChunk: () => claimStreamWinner(ctrl),
+          });
 
           if (!settled) {
             settled = true;
             rememberPreferredProxy(candidate.index, candidate.id);
             cleanupAll();
-            resolve({ bytes: buf, lastStatus: 200, oversize: false });
+            resolve({ bytes: buf, lastStatus: 200 });
           }
         } catch (err) {
-          if (err instanceof OversizeDownloadError) {
-            if (!settled) {
-              settled = true;
-              cleanupAll();
-              resolve({ bytes: null, lastStatus, oversize: true });
+          if (err instanceof LargeZipRangeSwitchSignal && !selectiveZipAttempted && !settled) {
+            selectiveZipAttempted = true;
+            settled = true;
+            cleanupAll();
+            try {
+              const rangeCandidates = [
+                candidate,
+                ...queue.filter((item) => item.id !== candidate.id),
+              ];
+              const compactZip = await tryDownloadSelectiveZipViaRange(
+                err.totalBytes,
+                rangeCandidates,
+                signal
+              );
+              if (compactZip) {
+                resolve({ bytes: compactZip, lastStatus: 200 });
+              } else {
+                resolve({ bytes: null, lastStatus: 0, fallbackToFullStream: true });
+              }
+            } catch (rangeErr) {
+              if (signal?.aborted) {
+                reject(rangeErr);
+              } else {
+                resolve({ bytes: null, lastStatus: 0, fallbackToFullStream: true });
+              }
             }
             return;
           }
-          if (!settled && !signal?.aborted) {
+
+          if (err instanceof HtmlOrJsonProxyError) {
+            if (!settled && !signal?.aborted) {
+              markProxyCooldown(candidate.id, 502);
+            }
+            return;
+          }
+
+          if (!settled && !signal?.aborted && !ctrl.signal.aborted) {
+            markProxyCooldown(candidate.id, 0);
+          } else if (
+            !settled &&
+            !signal?.aborted &&
+            ctrl.signal.aborted &&
+            activeStreamWinner === ctrl
+          ) {
+            // Stream stalled mid-transfer after winning -> cool down & let backup try
             markProxyCooldown(candidate.id, 0);
           }
         } finally {
-          globalThis.clearTimeout(timeoutId);
+          if (headerTimeoutId !== null) {
+            globalThis.clearTimeout(headerTimeoutId);
+            headerTimeoutId = null;
+          }
+          if (activeStreamWinner === ctrl) {
+            activeStreamWinner = null;
+          }
           activeControllers.delete(ctrl);
           inFlight--;
           if (!settled) {
             if (nextQueueIdx < queue.length && inFlight === 0) {
               launchNext();
-            } else if (nextQueueIdx < queue.length) {
+            } else if (nextQueueIdx < queue.length && activeStreamWinner === null) {
               scheduleHedge();
             } else {
               checkExhausted();
@@ -921,9 +1527,9 @@ export async function downloadZxArtFileSmart(
   const normalizedUrl = normalizeZxArtDownloadUrl(fileUrl);
 
   // Download strictly via external CORS proxies (identical on AI Studio and static sites)
-  const wave1 = await downloadViaHedgedProxyWave(normalizedUrl, false, signal);
-  if (wave1.oversize) {
-    throw new Error('Файл слишком большой для загрузки');
+  let wave1 = await downloadViaHedgedProxyWave(normalizedUrl, false, false, signal);
+  if (wave1.fallbackToFullStream) {
+    wave1 = await downloadViaHedgedProxyWave(normalizedUrl, false, true, signal);
   }
   if (wave1.bytes) {
     cacheDownloadedFile(fileUrl, wave1.bytes);
@@ -933,9 +1539,10 @@ export async function downloadZxArtFileSmart(
   // Brief backoff before Wave 2 (tries canonical id:<id>/ URL if filename has special chars, or retries all proxies)
   await sleepAbortable(350, signal);
   const canonicalUrl = buildCanonicalZxArtDownloadUrl(normalizedUrl);
-  const wave2 = await downloadViaHedgedProxyWave(canonicalUrl ?? normalizedUrl, true, signal);
-  if (wave2.oversize) {
-    throw new Error('Файл слишком большой для загрузки');
+  const targetWave2 = canonicalUrl ?? normalizedUrl;
+  let wave2 = await downloadViaHedgedProxyWave(targetWave2, true, false, signal);
+  if (wave2.fallbackToFullStream) {
+    wave2 = await downloadViaHedgedProxyWave(targetWave2, true, true, signal);
   }
   if (wave2.bytes) {
     cacheDownloadedFile(fileUrl, wave2.bytes);

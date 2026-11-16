@@ -1536,6 +1536,11 @@ export const ZxArtCatalog: React.FC<ZxArtCatalogProps> = ({
                                       <span className="px-1.5 py-0.5 rounded bg-zinc-800 border border-white/10 font-mono text-[10px] text-zinc-200">
                                         {profile.shortName}
                                       </span>
+                                      {item.slot !== undefined && (
+                                        <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 border border-emerald-400/30 font-mono text-[10px] text-emerald-300">
+                                          Слот {item.slot}
+                                        </span>
+                                      )}
                                       <span className="truncate">{formatSaveTimestamp(item.createdAt)}</span>
                                     </div>
                                   </div>

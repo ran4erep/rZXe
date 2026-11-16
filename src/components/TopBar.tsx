@@ -19,6 +19,7 @@ import {
 } from 'lucide-react';
 import { MACHINE_PROFILES, MachineId, getMachineProfile } from '../emulator/machines';
 import { SavedDiskMeta, SessionDiskHistoryItem } from '../emulator/diskStorage';
+import { SaveStateSlot } from '../emulator/saveStateStorage';
 import { DISK_ACCEPT_ATTR } from '../emulator/archiveExtractor';
 import { computeVisibleTopBarActionCount } from '../emulator/topBarLayout';
 
@@ -45,6 +46,7 @@ interface TopBarProps {
   onReset: () => void;
   onOpenGames: () => void;
   onOpenCatalogForDrive: (drive: 0 | 1) => void;
+  selectedSaveSlot: SaveStateSlot;
   onSaveState: () => void;
   onCaptureScreenshot: () => void;
   onOpenSaveStates: () => void;
@@ -74,6 +76,7 @@ export const TopBar: React.FC<TopBarProps> = React.memo(({
   onReset,
   onOpenGames,
   onOpenCatalogForDrive,
+  selectedSaveSlot,
   onSaveState,
   onCaptureScreenshot,
   onOpenSaveStates,
@@ -259,15 +262,22 @@ export const TopBar: React.FC<TopBarProps> = React.memo(({
     <button
       key="save"
       type="button"
+      data-testid="save-state-btn"
       onClick={() => {
         setSubBarOpen(false);
         onSaveState();
       }}
-      aria-label="Сохранить состояние"
-      title="Сохранить состояние"
-      className="w-8 sm:w-9 h-8 rounded-lg bg-zinc-800/90 hover:bg-zinc-700/90 text-zinc-200 flex items-center justify-center transition-colors shrink-0 cursor-pointer focus-visible:outline-2 focus-visible:outline-zinc-400"
+      aria-label={`Сохранить состояние (слот ${selectedSaveSlot})`}
+      title={`Сохранить состояние (Слот ${selectedSaveSlot})`}
+      className="relative w-8 sm:w-9 h-8 rounded-lg bg-zinc-800/90 hover:bg-zinc-700/90 text-zinc-200 flex items-center justify-center transition-colors shrink-0 cursor-pointer focus-visible:outline-2 focus-visible:outline-zinc-400"
     >
       <Save className="w-4 h-4 shrink-0" />
+      <span
+        aria-hidden="true"
+        className="absolute bottom-0.5 right-0.5 text-[9px] font-mono font-bold leading-none text-emerald-400"
+      >
+        {selectedSaveSlot}
+      </span>
     </button>,
 
     <button

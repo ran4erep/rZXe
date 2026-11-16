@@ -4,7 +4,7 @@
 import { TSTATES_PER_FRAME } from './spectrum';
 import { AY8910, StereoMode } from './ay8910';
 
-const RING_SIZE = 16384; // Power of 2; ~340ms at 48kHz, supports up to 192kHz DACs
+const RING_SIZE = 32768; // Power of 2; ~680ms at 48kHz, supports up to 192kHz DACs without stalls
 const MAX_FRAME_SAMPLES = 4096;
 
 // Precomputed 12-tap, 64-phase Blackman-windowed-sinc impulse table for aliasing-free BLEP
@@ -300,6 +300,8 @@ const BEEPER_WORKLET_SOURCE = `
 const RING_SIZE = ${RING_SIZE};
 const RING_MASK = RING_SIZE - 1;
 const STRIDE = ${WORKLET_BUF_STRIDE};
+const HIGH_WATERMARK = RING_SIZE >> 2;
+const LOW_WATERMARK = RING_SIZE >> 3;
 
 class ZXBeeperWorkletProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -309,6 +311,8 @@ class ZXBeeperWorkletProcessor extends AudioWorkletProcessor {
     this.writePtr = 0;
     this.readPtr = 0;
     this.buffered = 0;
+    this.seq = 0;
+    this.highWaterArmed = false;
     this.lastL = 0;
     this.lastR = 0;
     this.dcPrevInL = 0;
@@ -326,6 +330,8 @@ class ZXBeeperWorkletProcessor extends AudioWorkletProcessor {
         this.writePtr = 0;
         this.readPtr = 0;
         this.buffered = 0;
+        this.seq = typeof msg.seq === 'number' ? msg.seq : this.seq + 1;
+        this.highWaterArmed = false;
         this.lastL = 0;
         this.lastR = 0;
         this.dcPrevInL = 0;
@@ -337,6 +343,8 @@ class ZXBeeperWorkletProcessor extends AudioWorkletProcessor {
       }
 
       if (msg.type === 'fill') {
+        const msgSeq = typeof msg.seq === 'number' ? msg.seq : this.seq;
+        if (msgSeq !== this.seq) return;
         const prefill = msg.prefill | 0;
         if (this.buffered === 0 && prefill > 0) {
           const amp = msg.initAmp;
@@ -360,12 +368,22 @@ class ZXBeeperWorkletProcessor extends AudioWorkletProcessor {
           this.writePtr = (this.writePtr + 1) & RING_MASK;
         }
         if (count > 0) this.buffered += count;
-        this.port.postMessage({ type: 'status', buffered: this.buffered });
+        if (this.buffered > HIGH_WATERMARK) this.highWaterArmed = true;
+        this.port.postMessage({ type: 'status', buffered: this.buffered, seq: this.seq });
         return;
       }
 
       if (msg.type === 'push') {
         const src = msg.buf;
+        const msgSeq = typeof msg.seq === 'number' ? msg.seq : this.seq;
+        if (msgSeq !== this.seq) {
+          this.port.postMessage(
+            { type: 'recycle', buf: src, buffered: this.buffered, seq: this.seq },
+            [src.buffer]
+          );
+          return;
+        }
+
         const len = msg.len | 0;
         const mono = msg.mono === true;
         const prefill = msg.prefill | 0;
@@ -400,8 +418,9 @@ class ZXBeeperWorkletProcessor extends AudioWorkletProcessor {
           }
         }
         if (count > 0) this.buffered += count;
+        if (this.buffered > HIGH_WATERMARK) this.highWaterArmed = true;
         this.port.postMessage(
-          { type: 'recycle', buf: src, buffered: this.buffered },
+          { type: 'recycle', buf: src, buffered: this.buffered, seq: this.seq },
           [src.buffer]
         );
       }
@@ -413,17 +432,42 @@ class ZXBeeperWorkletProcessor extends AudioWorkletProcessor {
     if (!out || out.length < 2) return true;
     const outL = out[0];
     const outR = out[1];
-    const len = outL.length;
-    const pole = this.dcPole;
 
-    let readPtr = this.readPtr;
     let buffered = this.buffered;
     let lastL = this.lastL;
     let lastR = this.lastR;
-    let dcPrevInL = this.dcPrevInL;
     let dcPrevOutL = this.dcPrevOutL;
-    let dcPrevInR = this.dcPrevInR;
     let dcPrevOutR = this.dcPrevOutR;
+
+    // Ultra-low-CPU idle path when ring is drained and output settled at 0
+    if (
+      buffered === 0 &&
+      Math.abs(lastL) < 1e-6 &&
+      Math.abs(lastR) < 1e-6 &&
+      Math.abs(dcPrevOutL) < 1e-6 &&
+      Math.abs(dcPrevOutR) < 1e-6
+    ) {
+      if (this.highWaterArmed) {
+        this.highWaterArmed = false;
+        this.port.postMessage({ type: 'status', buffered: 0, seq: this.seq });
+      }
+      this.lastL = 0;
+      this.lastR = 0;
+      this.dcPrevInL = 0;
+      this.dcPrevOutL = 0;
+      this.dcPrevInR = 0;
+      this.dcPrevOutR = 0;
+      this.needsDcSeed = true;
+      outL.fill(0);
+      outR.fill(0);
+      return true;
+    }
+
+    const len = outL.length;
+    const pole = this.dcPole;
+    let readPtr = this.readPtr;
+    let dcPrevInL = this.dcPrevInL;
+    let dcPrevInR = this.dcPrevInR;
     let needsDcSeed = this.needsDcSeed;
     const ringL = this.ringL;
     const ringR = this.ringR;
@@ -467,12 +511,20 @@ class ZXBeeperWorkletProcessor extends AudioWorkletProcessor {
     this.dcPrevInR = dcPrevInR;
     this.dcPrevOutR = dcPrevOutR;
     this.needsDcSeed = needsDcSeed;
+
+    if (this.highWaterArmed && buffered <= LOW_WATERMARK) {
+      this.highWaterArmed = false;
+      this.port.postMessage({ type: 'status', buffered, seq: this.seq });
+    }
     return true;
   }
 }
 
 registerProcessor('zx-beeper-processor', ZXBeeperWorkletProcessor);
 `;
+
+const UNLOCK_EVENTS = ['pointerdown', 'pointerup', 'touchend', 'click', 'keydown'] as const;
+const DEFERRED_SUSPEND_MS = 4000;
 
 export class SpectrumBeeper {
   private ctx: AudioContext | null = null;
@@ -481,9 +533,14 @@ export class SpectrumBeeper {
   private workletLoading = false;
   private workletReady = false;
   private destroyed = false;
+  private muted = false;
   private freePool: Float32Array[] = [];
   private allocatedPoolCount = 0;
   private workletBuffered = 0;
+  private resetSeq = 0;
+  private blockedFrames = 0;
+  private suspendTimer: number | null = null;
+  private unlockListenersArmed = false;
 
   // Legacy ScriptProcessorNode fallback state (used only if AudioWorklet is unavailable)
   private procNode: ScriptProcessorNode | null = null;
@@ -508,6 +565,90 @@ export class SpectrumBeeper {
   private needsDcSeed = true;
   private sampleFracAcc = 0;
 
+  private readonly handleUserUnlockGesture = (): void => {
+    if (this.destroyed || this.muted || !this.active) {
+      this.disarmUnlockListeners();
+      return;
+    }
+    const ctx = this.ctx;
+    if (!ctx || ctx.state === 'closed') {
+      this.disarmUnlockListeners();
+      this.start();
+      return;
+    }
+    if (ctx.state === 'running') {
+      this.disarmUnlockListeners();
+      return;
+    }
+    void ctx
+      .resume()
+      .then(() => {
+        if (this.ctx === ctx && ctx.state === 'running') {
+          this.disarmUnlockListeners();
+        }
+      })
+      .catch(() => {});
+  };
+
+  private armUnlockListeners(): void {
+    if (this.unlockListenersArmed || typeof window === 'undefined') return;
+    this.unlockListenersArmed = true;
+    for (let i = 0; i < UNLOCK_EVENTS.length; i++) {
+      window.addEventListener(UNLOCK_EVENTS[i], this.handleUserUnlockGesture, {
+        capture: true,
+        passive: true,
+      });
+    }
+  }
+
+  private disarmUnlockListeners(): void {
+    if (!this.unlockListenersArmed || typeof window === 'undefined') return;
+    this.unlockListenersArmed = false;
+    for (let i = 0; i < UNLOCK_EVENTS.length; i++) {
+      window.removeEventListener(UNLOCK_EVENTS[i], this.handleUserUnlockGesture, {
+        capture: true,
+      });
+    }
+  }
+
+  private clearSuspendTimer(): void {
+    if (this.suspendTimer !== null && typeof window !== 'undefined') {
+      window.clearTimeout(this.suspendTimer);
+      this.suspendTimer = null;
+    }
+  }
+
+  private teardownGraph(): void {
+    this.clearSuspendTimer();
+    this.disarmUnlockListeners();
+    this.workletLoading = false;
+    this.workletReady = false;
+    if (this.workletNode) {
+      this.workletNode.port.onmessage = null;
+      this.workletNode.onprocessorerror = null;
+      this.workletNode.disconnect();
+      this.workletNode = null;
+    }
+    this.freePool.length = 0;
+    this.allocatedPoolCount = 0;
+    if (this.procNode) {
+      this.procNode.disconnect();
+      this.procNode.onaudioprocess = null;
+      this.procNode = null;
+    }
+    if (this.gainNode) {
+      this.gainNode.disconnect();
+      this.gainNode = null;
+    }
+    if (this.ctx) {
+      this.ctx.onstatechange = null;
+      if (this.ctx.state !== 'closed') {
+        void this.ctx.close().catch(() => {});
+      }
+      this.ctx = null;
+    }
+  }
+
   private acquireTransferBuffer(): Float32Array {
     const reused = this.freePool.pop();
     if (reused && reused.buffer.byteLength === WORKLET_BUF_TOTAL * 4) {
@@ -522,9 +663,11 @@ export class SpectrumBeeper {
   }
 
   private initFallbackScriptProcessor(ctx: AudioContext, gain: GainNode): void {
-    if (this.destroyed || this.procNode) return;
+    if (this.destroyed || this.procNode || this.ctx !== ctx) return;
     this.ringL = new Float32Array(RING_SIZE);
     this.ringR = new Float32Array(RING_SIZE);
+    this.readPtr = 0;
+    this.writePtr = 0;
     const proc = ctx.createScriptProcessor(512, 0, 2);
     proc.onaudioprocess = (ev) => {
       const outL = ev.outputBuffer.getChannelData(0);
@@ -593,7 +736,8 @@ export class SpectrumBeeper {
       node.port.onmessage = (ev) => {
         const msg = ev.data;
         if (!msg) return;
-        if (typeof msg.buffered === 'number') {
+        this.blockedFrames = 0;
+        if (typeof msg.buffered === 'number' && msg.seq === this.resetSeq) {
           this.workletBuffered = msg.buffered;
         }
         if (msg.type === 'recycle' && msg.buf instanceof Float32Array) {
@@ -603,11 +747,24 @@ export class SpectrumBeeper {
         }
       };
 
+      node.onprocessorerror = () => {
+        if (this.destroyed || this.ctx !== ctx || this.workletNode !== node) return;
+        node.port.onmessage = null;
+        node.onprocessorerror = null;
+        node.disconnect();
+        this.workletNode = null;
+        this.workletReady = false;
+        this.initFallbackScriptProcessor(ctx, gain);
+      };
+
       node.connect(gain);
       this.workletNode = node;
       this.workletReady = true;
       this.needsPrefill = true;
       this.workletBuffered = 0;
+      this.blockedFrames = 0;
+      this.resetSeq++;
+      node.port.postMessage({ type: 'reset', seq: this.resetSeq });
     } catch {
       if (!this.destroyed && this.ctx === ctx) {
         this.initFallbackScriptProcessor(ctx, gain);
@@ -621,12 +778,38 @@ export class SpectrumBeeper {
   }
 
   public start(): void {
-    if (this.destroyed) return;
+    // Allow clean revival if start() is called after a strict-mode/HMR unmount-remount cycle
+    if (this.destroyed) {
+      this.destroyed = false;
+    }
+    this.clearSuspendTimer();
+
+    if (this.ctx && this.ctx.state === 'closed') {
+      this.teardownGraph();
+    }
+
     if (this.ctx) {
-      if (this.ctx.state !== 'running') {
-        void this.ctx.resume();
+      this.active = !this.muted;
+      if (this.gainNode) {
+        this.gainNode.gain.value = this.muted ? 0 : this.volume;
       }
-      this.active = true;
+      if (!this.workletReady && !this.workletLoading && !this.procNode && this.gainNode) {
+        if (
+          typeof AudioWorkletNode !== 'undefined' &&
+          this.ctx.audioWorklet &&
+          typeof this.ctx.audioWorklet.addModule === 'function'
+        ) {
+          void this.initAudioWorklet(this.ctx, this.gainNode);
+        } else {
+          this.initFallbackScriptProcessor(this.ctx, this.gainNode);
+        }
+      }
+      if (this.ctx.state !== 'running') {
+        void this.ctx.resume().catch(() => {});
+        if (!this.muted) {
+          this.armUnlockListeners();
+        }
+      }
       return;
     }
 
@@ -640,14 +823,27 @@ export class SpectrumBeeper {
     this.sampleRate = ctx.sampleRate;
     this.dcPole = Math.exp((-2 * Math.PI * 20) / this.sampleRate);
 
+    ctx.onstatechange = () => {
+      if (this.destroyed || this.ctx !== ctx) return;
+      if (ctx.state === 'running') {
+        this.disarmUnlockListeners();
+      } else if (ctx.state === 'closed') {
+        this.teardownGraph();
+      } else if (!this.muted && this.active) {
+        this.armUnlockListeners();
+      }
+    };
+
     const gain = ctx.createGain();
-    gain.gain.value = this.volume;
+    gain.gain.value = this.muted ? 0 : this.volume;
     gain.connect(ctx.destination);
     this.gainNode = gain;
 
     this.needsPrefill = true;
     this.needsDcSeed = true;
-    this.active = true;
+    this.workletBuffered = 0;
+    this.blockedFrames = 0;
+    this.active = !this.muted;
 
     if (
       typeof AudioWorkletNode !== 'undefined' &&
@@ -660,17 +856,24 @@ export class SpectrumBeeper {
     }
 
     if (ctx.state !== 'running') {
-      void ctx.resume();
+      void ctx.resume().catch(() => {});
+      if (!this.muted) {
+        this.armUnlockListeners();
+      }
     }
   }
 
-  public setMuted(muted: boolean): void {
-    if (!this.ctx) return;
+  public setMuted(muted: boolean, immediateSuspend = false): void {
+    this.muted = muted;
+    this.clearSuspendTimer();
+
     if (muted) {
       this.active = false;
+      this.disarmUnlockListeners();
       this.readPtr = 0;
       this.writePtr = 0;
       this.workletBuffered = 0;
+      this.blockedFrames = 0;
       this.lastSampleL = 0;
       this.lastSampleR = 0;
       this.dcPrevInL = 0;
@@ -681,26 +884,57 @@ export class SpectrumBeeper {
       this.needsPrefill = true;
       this.needsDcSeed = true;
       resetBeeperSynthState(this.synthState);
+      if (this.gainNode) {
+        this.gainNode.gain.value = 0;
+      }
       if (this.workletNode) {
-        this.workletNode.port.postMessage({ type: 'reset' });
+        this.resetSeq++;
+        this.workletNode.port.postMessage({ type: 'reset', seq: this.resetSeq });
       }
-      if (this.ctx.state === 'running') {
-        void this.ctx.suspend();
+      const ctx = this.ctx;
+      if (!ctx || ctx.state === 'closed') return;
+      if (immediateSuspend) {
+        if (ctx.state === 'running') {
+          void ctx.suspend().catch(() => {});
+        }
+      } else if (typeof window !== 'undefined') {
+        // Defer ctx.suspend() across brief modals/pauses so async game loads keep user activation intact,
+        // while still sleeping the OS audio thread during extended pauses/menus.
+        this.suspendTimer = window.setTimeout(() => {
+          this.suspendTimer = null;
+          if (!this.muted || this.destroyed) return;
+          if (this.ctx === ctx && ctx.state === 'running') {
+            void ctx.suspend().catch(() => {});
+          }
+        }, DEFERRED_SUSPEND_MS);
       }
+      return;
+    }
+
+    this.active = true;
+    this.needsPrefill = true;
+    this.needsDcSeed = true;
+    this.workletBuffered = 0;
+    this.blockedFrames = 0;
+    if (this.gainNode) {
+      this.gainNode.gain.value = this.volume;
+    }
+    if (!this.ctx) return;
+    if (this.ctx.state === 'closed') {
+      this.start();
+      return;
+    }
+    if (this.ctx.state !== 'running') {
+      void this.ctx.resume().catch(() => {});
+      this.armUnlockListeners();
     } else {
-      this.active = true;
-      this.needsPrefill = true;
-      this.needsDcSeed = true;
-      this.workletBuffered = 0;
-      if (this.ctx.state !== 'running') {
-        void this.ctx.resume();
-      }
+      this.disarmUnlockListeners();
     }
   }
 
   public setVolume(vol: number): void {
     this.volume = Math.max(0, Math.min(1, vol));
-    if (this.gainNode) {
+    if (this.gainNode && !this.muted) {
       this.gainNode.gain.value = this.volume;
     }
   }
@@ -717,7 +951,7 @@ export class SpectrumBeeper {
     stereoMode: StereoMode = 'acb',
     ayClockHz = 1_773_400
   ): void {
-    if (!this.active || !this.ctx || this.ctx.state !== 'running') return;
+    if (!this.active || this.muted || !this.ctx || this.ctx.state !== 'running') return;
 
     const usingWorklet = this.workletReady && this.workletNode !== null;
     if (!usingWorklet && !this.procNode) {
@@ -769,8 +1003,20 @@ export class SpectrumBeeper {
     if (sampleCount <= 0) return;
 
     if (buffered > RING_SIZE - sampleCount - 64) {
+      if (usingWorklet) {
+        this.blockedFrames++;
+        if (this.blockedFrames >= 20) {
+          // Self-heal if worklet buffered count drifted or stalled across browser hiccups
+          this.blockedFrames = 0;
+          this.workletBuffered = 0;
+          this.needsPrefill = true;
+          this.resetSeq++;
+          this.workletNode!.port.postMessage({ type: 'reset', seq: this.resetSeq });
+        }
+      }
       return;
     }
+    this.blockedFrames = 0;
 
     const ayActive = Boolean(ay && ay.hasFrameAudio());
 
@@ -796,6 +1042,7 @@ export class SpectrumBeeper {
       this.workletBuffered += sampleCount;
       this.workletNode!.port.postMessage({
         type: 'fill',
+        seq: this.resetSeq,
         len: sampleCount,
         amp: initAmp,
         prefill: prefillSamples,
@@ -849,6 +1096,7 @@ export class SpectrumBeeper {
       this.workletNode!.port.postMessage(
         {
           type: 'push',
+          seq: this.resetSeq,
           buf: transferBuf,
           len: sampleCount,
           mono,
@@ -917,25 +1165,6 @@ export class SpectrumBeeper {
   public destroy(): void {
     this.destroyed = true;
     this.active = false;
-    this.workletReady = false;
-    if (this.workletNode) {
-      this.workletNode.port.onmessage = null;
-      this.workletNode.disconnect();
-      this.workletNode = null;
-    }
-    this.freePool.length = 0;
-    if (this.procNode) {
-      this.procNode.disconnect();
-      this.procNode.onaudioprocess = null;
-      this.procNode = null;
-    }
-    if (this.gainNode) {
-      this.gainNode.disconnect();
-      this.gainNode = null;
-    }
-    if (this.ctx) {
-      void this.ctx.close();
-      this.ctx = null;
-    }
+    this.teardownGraph();
   }
 }

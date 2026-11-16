@@ -677,7 +677,8 @@ export class ZXSpectrum48 implements Z80IO {
   }
 
   private queueAutoBootTrdos(runBoot = true, sourceFilename?: string): void {
-    if (this.machineId === 'scorpion256') {
+    const isScorpion = this.machineId === 'scorpion256';
+    if (isScorpion) {
       // Scorpion 256 menu (ready at ~180 frames): Item 0 is already 128 TR-DOS
       this.autoWaitIff1 = false;
       this.autoQueue = [{ keys: ['ENTER'] }];
@@ -700,7 +701,7 @@ export class ZXSpectrum48 implements Z80IO {
       const target = disk0 ? findTrdosAutoBootTarget(disk0, sourceFilename) : null;
       if (target && target.kind === 'named') {
         this.autoQueue.push(
-          { keys: [], hold: 45 },
+          { keys: [], hold: isScorpion ? 85 : 45 },
           { keys: ['R'], hold: 4 },
           { keys: ['SYMBOL', 'P'], hold: 4 }
         );
@@ -711,7 +712,8 @@ export class ZXSpectrum48 implements Z80IO {
           { keys: ['SYMBOL', 'P'], hold: 4 },
           { keys: ['ENTER'], hold: 4 }
         );
-      } else {
+      } else if (!isScorpion) {
+        // Scorpion 128 TR-DOS auto-runs "boot" automatically; Pentagon needs explicit RUN + ENTER
         this.autoQueue.push(
           { keys: [], hold: 45 },
           { keys: ['R'], hold: 4 },
@@ -775,6 +777,17 @@ export class ZXSpectrum48 implements Z80IO {
       if (low === 0x1f || low === 0x3f || low === 0x5f || low === 0x7f || low === 0xff) {
         return this.bdi.readPort(low);
       }
+    }
+
+    // Scorpion ZS 256 Shadow Monitor ROM (1FFD bit 1 = 1, bit 0 = 0):
+    // Kempston joystick is not mapped here; ProfROM 0x0237 polls IN A,(0x1F) AND 0xE0
+    // right after FDC command 0xC4 and hangs forever if bits 5..7 read as 0.
+    if (
+      this.profile.isScorpionPaging &&
+      (this.port1FFD & 0x03) === 0x02 &&
+      (port & 0xff) === 0x1f
+    ) {
+      return 0x20;
     }
 
     // ULA even port (A0 == 0)
@@ -1090,38 +1103,41 @@ export class ZXSpectrum48 implements Z80IO {
     let lastTapeIdx = this.tapeIndex;
     let idleAfterAuto = 0;
 
-    for (let f = 0; f < 640; f++) {
-      this.stepFrame(false);
+    try {
+      for (let f = 0; f < 640; f++) {
+        this.stepFrame(false);
 
-      if (this.tapePlayer.active) {
-        // Custom RAM loader took over via TapePlayer: let RAF turbo loop stream it cleanly
-        break;
-      }
+        if (this.tapePlayer.active) {
+          // Custom RAM loader took over via TapePlayer: let RAF turbo loop stream it cleanly
+          break;
+        }
 
-      if (this.autoQueue.length > 0 || this.autoPhase !== 'idle') {
-        idleAfterAuto = 0;
-        lastTapeIdx = this.tapeIndex;
-        continue;
-      }
+        if (this.autoQueue.length > 0 || this.autoPhase !== 'idle') {
+          idleAfterAuto = 0;
+          lastTapeIdx = this.tapeIndex;
+          continue;
+        }
 
-      if (this.tapeIndex !== lastTapeIdx) {
-        lastTapeIdx = this.tapeIndex;
-        idleAfterAuto = 0;
-      } else {
-        idleAfterAuto++;
-      }
+        if (this.tapeIndex !== lastTapeIdx) {
+          lastTapeIdx = this.tapeIndex;
+          idleAfterAuto = 0;
+        } else {
+          idleAfterAuto++;
+        }
 
-      if (this.tapeIndex >= this.tapeBlocks.length && !this.hasRemainingTapeSegments() && idleAfterAuto >= 2) {
-        break;
+        if (this.tapeIndex >= this.tapeBlocks.length && !this.hasRemainingTapeSegments() && idleAfterAuto >= 2) {
+          break;
+        }
+        // Support multi-load tapes where main program enters game before trailing blocks
+        if (this.tapeIndex > 0 && idleAfterAuto >= 35) {
+          break;
+        }
       }
-      // Support multi-load tapes where main program enters game before trailing blocks
-      if (this.tapeIndex > 0 && idleAfterAuto >= 35) {
-        break;
-      }
+    } finally {
+      this.cpuFreqMhz = prevFreq;
+      this.soundEnabled = prevSound;
     }
 
-    this.cpuFreqMhz = prevFreq;
-    this.soundEnabled = prevSound;
     this.audioTransitionCount = 0;
     this.renderFrame();
     // Keep dirty flags set so the next RAF tick paints the warped frame immediately

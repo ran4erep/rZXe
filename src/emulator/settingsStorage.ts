@@ -24,7 +24,7 @@ export const DEFAULT_EMULATOR_SETTINGS: EmulatorSettings = {
   volume: 1,
   stereoMode: 'acb',
   scanlines: false,
-  borderMode: 'full',
+  borderMode: 'none',
   screenScale: 'auto',
   cpuFreqMhz: 3.5,
   keyboardMode: 'auto',

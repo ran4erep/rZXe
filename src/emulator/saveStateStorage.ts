@@ -2,8 +2,14 @@
 
 import { MachineId, getMachineProfile } from './machines';
 
+export const SAVE_STATE_SLOTS = [1, 2, 3, 4, 5] as const;
+export type SaveStateSlot = (typeof SAVE_STATE_SLOTS)[number];
+export const DEFAULT_SAVE_STATE_SLOT: SaveStateSlot = 1;
+const SAVE_SLOT_STORAGE_KEY = 'zx_spectrum_save_slot_v1';
+
 export interface SaveStateMeta {
   id: string;
+  slot?: SaveStateSlot;
   title: string;
   gameKey?: string;
   machineId: MachineId;
@@ -50,14 +56,78 @@ function openSaveStateDb(): Promise<IDBDatabase | null> {
 }
 
 function toMeta(rec: SaveStateRecord): SaveStateMeta {
+  const validSlot =
+    rec.slot === 1 || rec.slot === 2 || rec.slot === 3 || rec.slot === 4 || rec.slot === 5
+      ? rec.slot
+      : undefined;
   return {
     id: rec.id,
+    slot: validSlot,
     title: rec.title,
     gameKey: rec.gameKey,
     machineId: rec.machineId,
     createdAt: rec.createdAt,
     screenshotDataUrl: rec.screenshotDataUrl,
   };
+}
+
+export function sanitizeSaveStateSlot(value: unknown): SaveStateSlot {
+  const num = typeof value === 'number' ? value : Number(value);
+  if (num === 1 || num === 2 || num === 3 || num === 4 || num === 5) {
+    return num;
+  }
+  return DEFAULT_SAVE_STATE_SLOT;
+}
+
+export function buildSaveStateSlotId(gameKey: string, slot: SaveStateSlot): string {
+  const normalizedKey = gameKey.trim().toLowerCase() || 'bios:128k';
+  return `${normalizedKey}::slot:${sanitizeSaveStateSlot(slot)}`;
+}
+
+export function loadSelectedSaveSlot(): SaveStateSlot {
+  if (typeof window === 'undefined' || !window.localStorage) {
+    return DEFAULT_SAVE_STATE_SLOT;
+  }
+  try {
+    return sanitizeSaveStateSlot(window.localStorage.getItem(SAVE_SLOT_STORAGE_KEY));
+  } catch {
+    return DEFAULT_SAVE_STATE_SLOT;
+  }
+}
+
+export function saveSelectedSaveSlot(slot: SaveStateSlot): void {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  try {
+    window.localStorage.setItem(SAVE_SLOT_STORAGE_KEY, String(sanitizeSaveStateSlot(slot)));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export function mapSaveStatesBySlot(states: readonly SaveStateMeta[]): {
+  slots: Record<SaveStateSlot, SaveStateMeta | null>;
+  legacy: SaveStateMeta[];
+} {
+  const slots: Record<SaveStateSlot, SaveStateMeta | null> = {
+    1: null,
+    2: null,
+    3: null,
+    4: null,
+    5: null,
+  };
+  const legacy: SaveStateMeta[] = [];
+  for (let i = 0; i < states.length; i++) {
+    const item = states[i];
+    const s = item.slot;
+    if (s === 1 || s === 2 || s === 3 || s === 4 || s === 5) {
+      if (slots[s] === null) {
+        slots[s] = item;
+      }
+    } else {
+      legacy.push(item);
+    }
+  }
+  return { slots, legacy };
 }
 
 export function resolveSaveStateGameKey(
@@ -212,6 +282,7 @@ export async function listSaveStates(): Promise<SaveStateMeta[]> {
 
 export async function putSaveState(params: {
   id: string;
+  slot?: SaveStateSlot;
   title: string;
   gameKey?: string;
   machineId: MachineId;
@@ -219,8 +290,11 @@ export async function putSaveState(params: {
   screenshotDataUrl: string;
   snaBytes: Uint8Array;
 }): Promise<SaveStateMeta> {
+  const validSlot =
+    params.slot !== undefined ? sanitizeSaveStateSlot(params.slot) : undefined;
   const record: SaveStateRecord = {
     id: params.id,
+    slot: validSlot,
     title: params.title.trim() || 'Снимок памяти',
     gameKey: params.gameKey,
     machineId: params.machineId,

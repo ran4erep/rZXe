@@ -40,6 +40,11 @@ import { SaveStatesModal } from './components/SaveStatesModal';
 import { loadEmulatorSettings, saveEmulatorSettings } from './emulator/settingsStorage';
 import {
   SaveStateMeta,
+  SaveStateSlot,
+  buildSaveStateSlotId,
+  sanitizeSaveStateSlot,
+  loadSelectedSaveSlot,
+  saveSelectedSaveSlot,
   listSaveStates,
   putSaveState,
   getSaveStateRecord,
@@ -103,6 +108,9 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [saveStatesOpen, setSaveStatesOpen] = useState(false);
   const [saveStates, setSaveStates] = useState<SaveStateMeta[]>([]);
+  const [selectedSaveSlot, setSelectedSaveSlot] = useState<SaveStateSlot>(() =>
+    loadSelectedSaveSlot()
+  );
   const [activeGameTitle, setActiveGameTitle] = useState<string | null>(null);
   const [activeGameKey, setActiveGameKey] = useState<string | null>(null);
   const [statusBanner, setStatusBanner] = useState<string | null>(null);
@@ -301,7 +309,7 @@ export default function App() {
     speccy.setCpuFreqMhz(settings.cpuFreqMhz);
     speccy.keyboard.setJoystickMode(settings.joystickMode);
     beeper.setVolume(settings.volume);
-    beeper.setMuted(!settings.soundEnabled || paused || anyModalOpen);
+    beeper.setMuted(!settings.soundEnabled || paused || anyModalOpen, !settings.soundEnabled);
     if (paused || anyModalOpen) {
       speccy.keyboard.releaseAllPhysical();
     }
@@ -370,12 +378,15 @@ export default function App() {
         speccy.soundEnabled = false;
         speccy.cpuFreqMhz = 3.5;
         const deadline = now + 7;
-        for (let k = 0; k < 16 && speccy.tapePlayer.active; k++) {
-          speccy.stepFrame(false);
-          if (performance.now() >= deadline) break;
+        try {
+          for (let k = 0; k < 16 && speccy.tapePlayer.active; k++) {
+            speccy.stepFrame(false);
+            if (performance.now() >= deadline) break;
+          }
+        } finally {
+          speccy.cpuFreqMhz = prevFreq;
+          speccy.soundEnabled = prevSound;
         }
-        speccy.cpuFreqMhz = prevFreq;
-        speccy.soundEnabled = prevSound;
         speccy.audioTransitionCount = 0;
         speccy.renderFrame();
         speccy.cpu.vramDirty = false;
@@ -452,10 +463,10 @@ export default function App() {
           cancelAnimationFrame(rafId);
           rafId = 0;
         }
-        beeper.setMuted(true);
+        beeper.setMuted(true, true);
         speccy.keyboard.releaseAllPhysical();
       } else {
-        beeper.setMuted(!settingsRef.current.soundEnabled || loopSleepingRef.current);
+        beeper.setMuted(!settingsRef.current.soundEnabled || loopSleepingRef.current, !settingsRef.current.soundEnabled);
         startLoop();
       }
     };
@@ -872,6 +883,12 @@ export default function App() {
     [showStatus, flushDrivePersist]
   );
 
+  const handleSelectSaveSlot = useCallback((slot: SaveStateSlot) => {
+    const normalized = sanitizeSaveStateSlot(slot);
+    setSelectedSaveSlot(normalized);
+    saveSelectedSaveSlot(normalized);
+  }, []);
+
   const handleSaveState = useCallback(async () => {
     unlockAudio();
     const speccy = spectrumRef.current!;
@@ -885,10 +902,7 @@ export default function App() {
         screenshotDataUrl = '';
       }
     }
-    const id =
-      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-        ? crypto.randomUUID()
-        : `save-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const slot = sanitizeSaveStateSlot(selectedSaveSlot);
     const title = activeGameTitle ?? diskNames[0] ?? getMachineProfile(speccy.machineId).name;
     const gameKey = resolveSaveStateGameKey(
       activeGameTitle,
@@ -896,8 +910,10 @@ export default function App() {
       speccy.machineId,
       activeGameKey
     );
+    const id = buildSaveStateSlotId(gameKey, slot);
     const meta = await putSaveState({
       id,
+      slot,
       title,
       gameKey,
       machineId: speccy.machineId,
@@ -905,8 +921,8 @@ export default function App() {
       snaBytes,
     });
     setSaveStates((prev) => [meta, ...prev.filter((item) => item.id !== meta.id)]);
-    showStatus('Состояние сохранено');
-  }, [activeGameTitle, activeGameKey, diskNames, unlockAudio, showStatus]);
+    showStatus(`Сохранено в слот ${slot}`);
+  }, [selectedSaveSlot, activeGameTitle, activeGameKey, diskNames, unlockAudio, showStatus]);
 
   const handleLoadSaveState = useCallback(
     async (id: string, zxArtGame?: ZxArtGameSummary | null) => {
@@ -951,7 +967,8 @@ export default function App() {
         showStatus('Не удалось скачать сохранение');
         return;
       }
-      triggerSaveStateDownload(rec.title, rec.snaBytes);
+      const downloadBase = rec.slot !== undefined ? `${rec.title}_slot${rec.slot}` : rec.title;
+      triggerSaveStateDownload(downloadBase, rec.snaBytes);
     },
     [showStatus]
   );
@@ -984,6 +1001,7 @@ export default function App() {
   const handleToggleSound = useCallback(() => {
     const next = !settingsRef.current.soundEnabled;
     if (next) {
+      beeperRef.current?.setMuted(false);
       beeperRef.current?.start();
     }
     setSettings((s) => ({ ...s, soundEnabled: next }));
@@ -1052,6 +1070,7 @@ export default function App() {
 
   const handleSettingsChange = useCallback((patch: Partial<EmulatorSettings>) => {
     if (patch.soundEnabled) {
+      beeperRef.current?.setMuted(false);
       beeperRef.current?.start();
     }
     setSettings((prev) => ({ ...prev, ...patch }));
@@ -1092,6 +1111,7 @@ export default function App() {
 
   return (
     <main
+      onPointerDownCapture={unlockAudio}
       className="h-dvh w-screen overflow-hidden bg-[#0e0f12] flex flex-col"
       data-testid="emulator-root"
       data-keyboard-visible={showKeyboard ? 'true' : 'false'}
@@ -1120,6 +1140,7 @@ export default function App() {
         onReset={handleReset}
         onOpenGames={handleOpenGames}
         onOpenCatalogForDrive={handleOpenCatalogForDrive}
+        selectedSaveSlot={selectedSaveSlot}
         onSaveState={handleSaveStateClick}
         onCaptureScreenshot={handleCaptureScreenshotClick}
         onOpenSaveStates={handleOpenSaveStates}
@@ -1177,8 +1198,10 @@ export default function App() {
         open={saveStatesOpen}
         saveStates={visibleSaveStates}
         allSaveStates={saveStates}
+        selectedSlot={selectedSaveSlot}
         activeGameLabel={activeGameTitle ?? diskNames[0] ?? null}
         isVersionScoped={isVersionScoped}
+        onSelectSlot={handleSelectSaveSlot}
         onClose={handleCloseSaveStates}
         onLoadSaveState={handleLoadSaveStateVoid}
         onDownloadSaveState={handleDownloadSaveStateVoid}

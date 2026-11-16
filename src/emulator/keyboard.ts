@@ -146,7 +146,6 @@ export class KeyboardMatrix {
   private readonly virtualPendingRelease = new Set<string>();
   private readonly virtualHoldFrames = new Map<string, number>();
   private readonly virtualPointers = new Map<number, VirtualPointerAction>();
-  private readonly virtualSlideTargets = new Map<number, string>();
 
   constructor() {
     this.rows.fill(0x1f);
@@ -164,7 +163,6 @@ export class KeyboardMatrix {
     this.virtualPendingRelease.clear();
     this.virtualHoldFrames.clear();
     this.virtualPointers.clear();
-    this.virtualSlideTargets.clear();
     this.virtualKempstonMask = 0;
     this.hardwareGamepadMask = 0;
     this.hardwareGamepadStickMask = 0;
@@ -218,26 +216,35 @@ export class KeyboardMatrix {
     }
   }
 
-  public setVirtualShiftSlideTarget(pointerId: number, targetKeyId: string | null): void {
-    const prevTarget = this.virtualSlideTargets.get(pointerId) ?? null;
-    if (prevTarget === targetKeyId) return;
-    if (prevTarget !== null) {
-      this.virtualSlideTargets.delete(pointerId);
-      this.setVirtualKey(prevTarget, false);
-    }
-    if (targetKeyId !== null) {
-      this.virtualSlideTargets.set(pointerId, targetKeyId);
+  /**
+   * Commits a Shift-swipe chord [shiftId, targetKeyId] on pointer release without having pressed
+   * any intermediate keys along the drag path, refreshing Shift's hold latch so both keys
+   * stay active together for MIN_VIRTUAL_HOLD_FRAMES.
+   */
+  public commitVirtualShiftSlide(
+    pointerId: number,
+    shiftId: string,
+    targetKeyId: string
+  ): void {
+    const action = this.virtualPointers.get(pointerId);
+    if (action) {
+      this.virtualPointers.delete(pointerId);
+      this.setVirtualKey(shiftId, true);
       this.setVirtualKey(targetKeyId, true);
+      this.setVirtualKey(targetKeyId, false);
+      for (let i = 0; i < action.keys.length; i++) {
+        this.setVirtualKey(action.keys[i], false);
+      }
+      return;
     }
+
+    this.setVirtualKey(shiftId, true);
+    this.setVirtualKey(targetKeyId, true);
+    this.setVirtualKey(targetKeyId, false);
+    this.setVirtualKey(shiftId, false);
   }
 
   public releaseVirtualButton(pointerId: number): void {
-    const slideTarget = this.virtualSlideTargets.get(pointerId);
-    if (slideTarget !== undefined) {
-      this.virtualSlideTargets.delete(pointerId);
-      this.setVirtualKey(slideTarget, false);
-    }
-
     const action = this.virtualPointers.get(pointerId);
     if (!action) return;
     this.virtualPointers.delete(pointerId);
@@ -347,7 +354,6 @@ export class KeyboardMatrix {
   public releaseAllVirtual(): void {
     this.setContinuousPadMask(0);
     this.virtualPointers.clear();
-    this.virtualSlideTargets.clear();
 
     if (this.virtualPressed.size > 0) {
       for (const id of this.virtualPressed) {
