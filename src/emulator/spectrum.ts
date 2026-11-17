@@ -30,9 +30,11 @@ import {
 import { ParsedTapeImage, parseTapeImage, wrapCodeBytesAsTap } from './tapeFormats';
 import { isHobetaExtension, parseDiskOrMediaImage } from './diskFormats';
 import {
+  GIGASCREEN_BAND_COUNT,
   GigascreenMode,
   blendFrames5050,
-  computeActiveFrameHash,
+  computeActiveBandHashes,
+  copyFrameWithDiff,
   renderBeamSpan,
   renderStaticFrame,
   tstatesToBeamPos,
@@ -130,13 +132,16 @@ export class ZXSpectrum48 implements Z80IO {
   public hasRenderedFrame = false;
   public gigascreenMode: GigascreenMode = 'auto';
 
-  // Auto-Gigascreen detection state (Bank 5/7 toggle + 256-sample frame hash alternation)
+  // Auto-Gigascreen detection state (Bank 5/7 toggle + 8-band period-2 frame alternation)
+  private prevScreenStartBank = 5;
   private prevScreenEndBank = 5;
+  private frameStartScreenBank = 5;
   private bankFlipStreak = 0;
-  private hash1 = 0;
-  private hash2 = 0;
-  private hasHash1 = false;
-  private hasHash2 = false;
+  private bandHash0 = new Uint32Array(GIGASCREEN_BAND_COUNT);
+  private bandHash1 = new Uint32Array(GIGASCREEN_BAND_COUNT);
+  private bandHash2 = new Uint32Array(GIGASCREEN_BAND_COUNT);
+  private hasBandHash1 = false;
+  private hasBandHash2 = false;
   private hashFlipStreak = 0;
   private autoBlendHold = 0;
 
@@ -265,12 +270,12 @@ export class ZXSpectrum48 implements Z80IO {
     this.beamPos = 0;
     this.cpu.beamActiveStartT = 0x7fffffff;
     this.cpu.beamActiveEndT = 0;
+    this.prevScreenStartBank = 5;
     this.prevScreenEndBank = 5;
+    this.frameStartScreenBank = 5;
     this.bankFlipStreak = 0;
-    this.hash1 = 0;
-    this.hash2 = 0;
-    this.hasHash1 = false;
-    this.hasHash2 = false;
+    this.hasBandHash1 = false;
+    this.hasBandHash2 = false;
     this.hashFlipStreak = 0;
     this.autoBlendHold = 0;
     this.frameCount = 0;
@@ -339,8 +344,8 @@ export class ZXSpectrum48 implements Z80IO {
     this.updateMemoryBanks();
   }
 
-  public setGigascreenMode(mode: GigascreenMode): void {
-    if (this.gigascreenMode === mode) return;
+  public setGigascreenMode(mode: GigascreenMode): boolean {
+    if (this.gigascreenMode === mode) return false;
     const prevMode = this.gigascreenMode;
     this.gigascreenMode = mode;
 
@@ -352,23 +357,40 @@ export class ZXSpectrum48 implements Z80IO {
       this.outputIsBlended = false;
       this.paintedBorderA = -1;
       this.paintedBorderB = -1;
+      this.prevScreenStartBank = this.screenBankIdx;
+      this.prevScreenEndBank = this.screenBankIdx;
       this.bankFlipStreak = 0;
       this.hashFlipStreak = 0;
       this.autoBlendHold = 0;
-      this.hasHash1 = false;
-      this.hasHash2 = false;
-    } else if (mode === 'off') {
+      this.hasBandHash1 = false;
+      this.hasBandHash2 = false;
+      return false;
+    }
+    if (mode === 'off') {
+      let changed = false;
       if (this.outputIsBlended && this.hasRenderedFrame) {
-        this.frameBuffer.set(this.currRaw);
+        changed = copyFrameWithDiff(this.currRaw, this.frameBuffer);
       }
       this.outputIsBlended = false;
       this.hasPrevRaw = false;
       this.paintedBorderOut = -1;
-    } else {
-      this.bankFlipStreak = 0;
-      this.hashFlipStreak = 0;
-      this.autoBlendHold = 0;
+      return changed;
     }
+
+    this.bankFlipStreak = 0;
+    this.hashFlipStreak = 0;
+    this.autoBlendHold = 0;
+    if (mode === 'on' && this.hasPrevRaw && this.hasRenderedFrame && !this.outputIsBlended) {
+      const changed = blendFrames5050(this.currRaw, this.prevRaw, this.frameBuffer);
+      this.outputIsBlended = true;
+      return changed;
+    }
+    if (mode === 'auto' && this.outputIsBlended && this.hasRenderedFrame) {
+      const changed = copyFrameWithDiff(this.currRaw, this.frameBuffer);
+      this.outputIsBlended = false;
+      return changed;
+    }
+    return false;
   }
 
   public mountDisk(driveIdx: 0 | 1, filename: string, bytes: Uint8Array): void {
@@ -915,10 +937,7 @@ export class ZXSpectrum48 implements Z80IO {
       if (border !== this.borderColor) {
         if (this.beamRenderEnabled) {
           const beamT = this.mapToFrameT(tstates, frameT);
-          if (
-            beamT > this.beamVisibleStartT &&
-            (this.beamActive || beamT < this.beamVisibleEndT)
-          ) {
+          if (beamT > this.beamVisibleStartT) {
             this.flushBeamTo(tstates);
           }
         }
@@ -967,10 +986,7 @@ export class ZXSpectrum48 implements Z80IO {
         if (nextScreen !== this.screenBankIdx) {
           if (this.beamRenderEnabled) {
             const beamT = this.mapToFrameT(tstates, this.profile.tstatesPerFrame);
-            if (
-              beamT > this.beamActiveStartUlaT &&
-              (this.beamActive || beamT < this.beamActiveEndUlaT)
-            ) {
+            if (beamT > this.beamActiveStartUlaT) {
               this.flushBeamTo(tstates);
             }
           }
@@ -1281,37 +1297,58 @@ export class ZXSpectrum48 implements Z80IO {
     this.beamPos = targetPos;
   }
 
-  private presentRenderedRawFrame(): void {
+  private presentRenderedRawFrame(): boolean {
+    const wasRendered = this.hasRenderedFrame;
     this.hasRenderedFrame = true;
     if (this.gigascreenMode === 'off') {
       this.outputIsBlended = false;
-      return;
+      return true;
     }
 
     let shouldBlend = false;
     if (this.gigascreenMode === 'on') {
       shouldBlend = this.hasPrevRaw;
     } else {
-      if (this.hasPrevRaw && this.screenBankIdx !== this.prevScreenEndBank) {
+      const bankFlipped =
+        this.hasPrevRaw &&
+        (this.screenBankIdx !== this.prevScreenEndBank ||
+          this.frameStartScreenBank !== this.prevScreenStartBank);
+      if (bankFlipped) {
         this.bankFlipStreak++;
       } else {
         this.bankFlipStreak = 0;
       }
+      this.prevScreenStartBank = this.frameStartScreenBank;
       this.prevScreenEndBank = this.screenBankIdx;
 
-      const h0 = computeActiveFrameHash(this.currRaw);
-      if (this.hasHash2 && h0 === this.hash2 && h0 !== this.hash1) {
-        this.hashFlipStreak++;
+      computeActiveBandHashes(this.currRaw, this.bandHash0);
+      if (this.hasBandHash2) {
+        let period2Bands = 0;
+        for (let b = 0; b < GIGASCREEN_BAND_COUNT; b++) {
+          const h0 = this.bandHash0[b];
+          if (h0 === this.bandHash2[b] && h0 !== this.bandHash1[b]) {
+            period2Bands++;
+          }
+        }
+        if (period2Bands >= 2) {
+          this.hashFlipStreak++;
+        } else {
+          this.hashFlipStreak = 0;
+        }
       } else {
         this.hashFlipStreak = 0;
       }
-      this.hash2 = this.hash1;
-      this.hasHash2 = this.hasHash1;
-      this.hash1 = h0;
-      this.hasHash1 = true;
+
+      // Rotate pre-allocated band-hash buffers with zero heap allocation
+      const oldest = this.bandHash2;
+      this.bandHash2 = this.bandHash1;
+      this.bandHash1 = this.bandHash0;
+      this.bandHash0 = oldest;
+      this.hasBandHash2 = this.hasBandHash1;
+      this.hasBandHash1 = true;
 
       if (this.bankFlipStreak >= 2 || this.hashFlipStreak >= 2) {
-        this.autoBlendHold = 4;
+        this.autoBlendHold = 6;
       } else if (this.autoBlendHold > 0) {
         this.autoBlendHold--;
       }
@@ -1319,14 +1356,16 @@ export class ZXSpectrum48 implements Z80IO {
       shouldBlend = this.hasPrevRaw && this.autoBlendHold > 0;
     }
 
+    let outputChanged: boolean;
     if (shouldBlend) {
-      blendFrames5050(this.currRaw, this.prevRaw, this.frameBuffer);
+      outputChanged = blendFrames5050(this.currRaw, this.prevRaw, this.frameBuffer);
       this.outputIsBlended = true;
     } else {
-      this.frameBuffer.set(this.currRaw);
+      outputChanged = copyFrameWithDiff(this.currRaw, this.frameBuffer);
       this.outputIsBlended = false;
     }
     this.hasPrevRaw = true;
+    return outputChanged || !wasRendered;
   }
 
   public stepFrame(render = true): boolean {
@@ -1360,6 +1399,7 @@ export class ZXSpectrum48 implements Z80IO {
     this.beamRenderEnabled = render;
     this.beamActive = false;
     this.beamPos = 0;
+    this.frameStartScreenBank = this.screenBankIdx;
     if (render) {
       const tPerLine = this.profile.tstatesPerLine;
       const firstActiveT = this.profile.firstActiveT;
@@ -1453,19 +1493,21 @@ export class ZXSpectrum48 implements Z80IO {
     this.borderDirty = false;
 
     if (!rawRendered) {
+      if (this.autoBlendHold > 0) {
+        this.autoBlendHold--;
+      }
+      this.bankFlipStreak = 0;
+      this.hashFlipStreak = 0;
       if (this.outputIsBlended && this.gigascreenMode !== 'off') {
-        this.frameBuffer.set(this.currRaw);
+        const changed = copyFrameWithDiff(this.currRaw, this.frameBuffer);
+        this.prevRaw.set(this.currRaw);
         this.outputIsBlended = false;
-        this.bankFlipStreak = 0;
-        this.hashFlipStreak = 0;
-        this.autoBlendHold = 0;
-        return true;
+        return changed;
       }
       return false;
     }
 
-    this.presentRenderedRawFrame();
-    return true;
+    return this.presentRenderedRawFrame();
   }
 
   public renderFrame(): void {
@@ -1475,9 +1517,11 @@ export class ZXSpectrum48 implements Z80IO {
     this.bankFlipStreak = 0;
     this.hashFlipStreak = 0;
     this.autoBlendHold = 0;
-    this.hasHash1 = false;
-    this.hasHash2 = false;
+    this.hasBandHash1 = false;
+    this.hasBandHash2 = false;
+    this.prevScreenStartBank = this.screenBankIdx;
     this.prevScreenEndBank = this.screenBankIdx;
+    this.frameStartScreenBank = this.screenBankIdx;
 
     const borderIdx = this.borderColor & 0x07;
     if (this.gigascreenMode === 'off') {

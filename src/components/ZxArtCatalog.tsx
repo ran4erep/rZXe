@@ -24,6 +24,7 @@ import {
 } from 'lucide-react';
 import { computeCatalogGrid, CatalogGridLayout } from '../emulator/catalogGrid';
 import {
+  TouchKeyboardViewportState,
   ZXART_ALL_CATEGORY_ID,
   ZXART_GAMES_CATEGORY_ID,
   ZxArtCategory,
@@ -33,6 +34,8 @@ import {
   addZxArtSearchHistory,
   buildZxArtReleaseGameKey,
   clearZxArtSearchHistory,
+  createTouchKeyboardViewportState,
+  evaluateTouchKeyboardResize,
   extractAvailableReleaseFormats,
   filterReleasesByFormat,
   formatReleaseTypeLabel,
@@ -42,6 +45,7 @@ import {
   removeZxArtSearchHistoryItem,
   resolveCatalogOpenSelection,
   resolveTargetMachine,
+  shouldCommitHistoryOnSearchBlur,
   sortReleasesForCatalogMode,
 } from '../emulator/zxartCatalog';
 import {
@@ -297,6 +301,7 @@ export const ZxArtCatalog: React.FC<ZxArtCatalogProps> = ({
 }) => {
   const isDiskMode = targetDrive !== null;
   const driveLetter = targetDrive === 1 ? 'B' : 'A';
+  const catalogRootRef = useRef<HTMLDivElement | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const widthMeasureRef = useRef<HTMLDivElement | null>(null);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
@@ -316,6 +321,7 @@ export const ZxArtCatalog: React.FC<ZxArtCatalogProps> = ({
   const [appliedSearch, setAppliedSearch] = useState('');
   const [searchHistory, setSearchHistory] = useState<string[]>(() => loadZxArtSearchHistory());
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [searchFocused, setSearchFocused] = useState(false);
 
   const [games, setGames] = useState<ZxArtGameSummary[]>([]);
   const [totalAmount, setTotalAmount] = useState(0);
@@ -348,7 +354,18 @@ export const ZxArtCatalog: React.FC<ZxArtCatalogProps> = ({
   const inFlightMoreRef = useRef(false);
   const moreAbortRef = useRef<AbortController | null>(null);
   const launchAbortRef = useRef<AbortController | null>(null);
-  const skipHistoryCommitRef = useRef(false);
+  const searchInputValueRef = useRef(searchInput);
+  searchInputValueRef.current = searchInput;
+  const searchFocusedRef = useRef(searchFocused);
+  searchFocusedRef.current = searchFocused;
+  const lastInputPointerTypeRef = useRef<string>('');
+  const focusedViaTouchRef = useRef(false);
+  const suppressBlurCommitRef = useRef(false);
+  const committedThisFocusRef = useRef(false);
+  const baselineCapturedForFocusRef = useRef(false);
+  const kbViewportStateRef = useRef<TouchKeyboardViewportState>(
+    createTouchKeyboardViewportState(0, 0)
+  );
 
   // O(1) lookup maps: aggregate count per game card (prodId/title) AND strict per-release list
   const saveStats = useMemo(() => {
@@ -437,6 +454,68 @@ export const ZxArtCatalog: React.FC<ZxArtCatalogProps> = ({
     return () => document.removeEventListener('pointerdown', onPointerDown);
   }, [historyOpen]);
 
+  // Attach touch-keyboard close & blur-suppression listeners ONLY while the search box is focused (0 CPU idle)
+  useEffect(() => {
+    if (!searchFocused) return;
+
+    const getViewportSize = () => {
+      const vv = window.visualViewport;
+      if (vv) {
+        return { width: vv.width, height: vv.height };
+      }
+      return { width: window.innerWidth, height: window.innerHeight };
+    };
+
+    const onDocumentPointerDown = (e: PointerEvent) => {
+      const target = e.target as Node | null;
+      if (!target) return;
+      if (searchInputRef.current && searchInputRef.current.contains(target)) {
+        suppressBlurCommitRef.current = false;
+        return;
+      }
+      const inSearchWrap = Boolean(searchBoxWrapRef.current?.contains(target));
+      const inCatalog = Boolean(catalogRootRef.current?.contains(target));
+      const isSelect = target instanceof Element && target.closest('select') !== null;
+
+      suppressBlurCommitRef.current = inSearchWrap || !inCatalog || isSelect;
+    };
+
+    const onViewportResize = () => {
+      if (!focusedViaTouchRef.current) return;
+      const { width, height } = getViewportSize();
+      const closed = evaluateTouchKeyboardResize(kbViewportStateRef.current, width, height);
+      if (!closed) return;
+
+      if (!committedThisFocusRef.current && !suppressBlurCommitRef.current) {
+        const trimmed = searchInputValueRef.current.trim();
+        if (trimmed) {
+          recordSearchHistory(trimmed);
+          setAppliedSearch((prev) => (prev === trimmed ? prev : trimmed));
+        }
+        committedThisFocusRef.current = true;
+      }
+      setHistoryOpen(false);
+      searchInputRef.current?.blur();
+    };
+
+    document.addEventListener('pointerdown', onDocumentPointerDown, true);
+    const vv = window.visualViewport;
+    if (vv) {
+      vv.addEventListener('resize', onViewportResize);
+    } else {
+      window.addEventListener('resize', onViewportResize);
+    }
+
+    return () => {
+      document.removeEventListener('pointerdown', onDocumentPointerDown, true);
+      if (vv) {
+        vv.removeEventListener('resize', onViewportResize);
+      } else {
+        window.removeEventListener('resize', onViewportResize);
+      }
+    };
+  }, [searchFocused, recordSearchHistory]);
+
   // Load genre subcategories once
   useEffect(() => {
     if (CLIENT_CATEGORIES_CACHE.list) return;
@@ -454,31 +533,17 @@ export const ZxArtCatalog: React.FC<ZxArtCatalogProps> = ({
     return () => ctrl.abort();
   }, []);
 
-  // Debounce search input smoothly and record settled queries (>= 2 chars) in search history
+  // Debounce catalog query smoothly without writing unfinished text into search history
   useEffect(() => {
     const trimmed = searchInput.trim();
     const applyTimer = window.setTimeout(() => {
       setAppliedSearch((prev) => (prev === trimmed ? prev : trimmed));
     }, 320);
 
-    let historyTimer: number | undefined;
-    if (trimmed.length >= 2) {
-      historyTimer = window.setTimeout(() => {
-        if (skipHistoryCommitRef.current) {
-          skipHistoryCommitRef.current = false;
-          return;
-        }
-        recordSearchHistory(trimmed);
-      }, 750);
-    }
-
     return () => {
       window.clearTimeout(applyTimer);
-      if (historyTimer !== undefined) {
-        window.clearTimeout(historyTimer);
-      }
     };
-  }, [searchInput, recordSearchHistory]);
+  }, [searchInput]);
 
   const fetchBatch = useCallback(
     async (
@@ -740,8 +805,9 @@ export const ZxArtCatalog: React.FC<ZxArtCatalogProps> = ({
   const handleOpenGame = useCallback(
     (game: ZxArtGameSummary) => {
       const activeQuery = searchInput.trim() || appliedSearch.trim();
-      if (activeQuery.length >= 2) {
+      if (activeQuery) {
         recordSearchHistory(activeQuery);
+        committedThisFocusRef.current = true;
       }
       setHistoryOpen(false);
       onError(null);
@@ -935,12 +1001,14 @@ export const ZxArtCatalog: React.FC<ZxArtCatalogProps> = ({
     if (trimmed !== appliedSearch) {
       setAppliedSearch(trimmed);
     }
+    committedThisFocusRef.current = true;
     setHistoryOpen(false);
     searchInputRef.current?.blur();
   };
 
   const handleSelectHistoryQuery = (query: string) => {
-    skipHistoryCommitRef.current = true;
+    committedThisFocusRef.current = true;
+    suppressBlurCommitRef.current = true;
     setSearchInput(query);
     setAppliedSearch(query);
     recordSearchHistory(query);
@@ -948,8 +1016,75 @@ export const ZxArtCatalog: React.FC<ZxArtCatalogProps> = ({
     searchInputRef.current?.blur();
   };
 
+  const handleSearchInputPointerDown = (e: React.PointerEvent<HTMLInputElement>) => {
+    lastInputPointerTypeRef.current = e.pointerType;
+    suppressBlurCommitRef.current = false;
+    if (!searchFocusedRef.current) {
+      const vv = window.visualViewport;
+      const w = vv ? vv.width : window.innerWidth;
+      const h = vv ? vv.height : window.innerHeight;
+      kbViewportStateRef.current = createTouchKeyboardViewportState(w, h);
+      baselineCapturedForFocusRef.current = true;
+    }
+  };
+
+  const handleSearchInputFocus = () => {
+    const pointerType = lastInputPointerTypeRef.current;
+    const isCoarsePointer =
+      typeof window !== 'undefined' &&
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(pointer: coarse)').matches;
+    const viaTouch =
+      pointerType === 'touch' ||
+      pointerType === 'pen' ||
+      (pointerType === '' && isCoarsePointer);
+
+    focusedViaTouchRef.current = viaTouch;
+    suppressBlurCommitRef.current = false;
+    committedThisFocusRef.current = false;
+    if (!baselineCapturedForFocusRef.current) {
+      const vv = window.visualViewport;
+      const w = vv ? vv.width : window.innerWidth;
+      const h = vv ? vv.height : window.innerHeight;
+      kbViewportStateRef.current = createTouchKeyboardViewportState(w, h);
+    }
+    baselineCapturedForFocusRef.current = false;
+    setSearchFocused(true);
+    setHistoryOpen(true);
+  };
+
+  const handleSearchInputBlur = () => {
+    const windowLostFocus =
+      document.hidden || document.activeElement === searchInputRef.current;
+    const suppressed = suppressBlurCommitRef.current;
+    const shouldCommit = shouldCommitHistoryOnSearchBlur({
+      query: searchInputValueRef.current,
+      focusedViaTouch: focusedViaTouchRef.current,
+      keyboardOpen: kbViewportStateRef.current.keyboardOpen,
+      suppressed,
+      alreadyCommitted: committedThisFocusRef.current,
+      windowLostFocus,
+    });
+
+    if (shouldCommit) {
+      const trimmed = searchInputValueRef.current.trim();
+      recordSearchHistory(trimmed);
+      setAppliedSearch((prev) => (prev === trimmed ? prev : trimmed));
+      committedThisFocusRef.current = true;
+    }
+
+    if (!suppressed) {
+      setHistoryOpen(false);
+    }
+    kbViewportStateRef.current.keyboardOpen = false;
+    focusedViaTouchRef.current = false;
+    suppressBlurCommitRef.current = false;
+    lastInputPointerTypeRef.current = '';
+    setSearchFocused(false);
+  };
+
   return (
-    <div className="flex-1 min-h-0 flex flex-col" data-testid="zxart-catalog">
+    <div ref={catalogRootRef} className="flex-1 min-h-0 flex flex-col" data-testid="zxart-catalog">
       {/* Keep catalog grid mounted & hidden while viewing a game's releases so scroll & cache survive Back cleanly at 0 CPU cost */}
       <div className={selectedGame ? 'hidden' : 'flex-1 min-h-0 flex flex-col'}>
         {/* Filter & search toolbar */}
@@ -970,8 +1105,14 @@ export const ZxArtCatalog: React.FC<ZxArtCatalogProps> = ({
               enterKeyHint="search"
               autoComplete="off"
               value={searchInput}
-              onChange={(e) => setSearchInput(e.target.value)}
-              onFocus={() => setHistoryOpen(true)}
+              onChange={(e) => {
+                committedThisFocusRef.current = false;
+                suppressBlurCommitRef.current = false;
+                setSearchInput(e.target.value);
+              }}
+              onPointerDown={handleSearchInputPointerDown}
+              onFocus={handleSearchInputFocus}
+              onBlur={handleSearchInputBlur}
               onClick={() => setHistoryOpen(true)}
               onKeyDown={(e) => {
                 if (e.key === 'Escape' && historyOpen) {
@@ -988,9 +1129,15 @@ export const ZxArtCatalog: React.FC<ZxArtCatalogProps> = ({
             {searchInput && (
               <button
                 type="button"
+                onPointerDown={(e) => {
+                  suppressBlurCommitRef.current = true;
+                  e.preventDefault();
+                }}
                 onMouseDown={(e) => e.preventDefault()}
                 onClick={() => {
                   const isFocused = document.activeElement === searchInputRef.current;
+                  suppressBlurCommitRef.current = false;
+                  committedThisFocusRef.current = false;
                   setSearchInput('');
                   setAppliedSearch('');
                   setHistoryOpen(isFocused);
@@ -1013,6 +1160,7 @@ export const ZxArtCatalog: React.FC<ZxArtCatalogProps> = ({
                   <button
                     type="button"
                     onClick={() => {
+                      suppressBlurCommitRef.current = false;
                       setSearchHistory(clearZxArtSearchHistory());
                       setHistoryOpen(false);
                     }}
@@ -1038,6 +1186,7 @@ export const ZxArtCatalog: React.FC<ZxArtCatalogProps> = ({
                       <button
                         type="button"
                         onClick={() => {
+                          suppressBlurCommitRef.current = false;
                           setSearchHistory((prev) => removeZxArtSearchHistoryItem(prev, item));
                         }}
                         aria-label={`Удалить «${item}» из истории`}

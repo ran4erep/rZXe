@@ -324,18 +324,62 @@ export function renderStaticFrame(
 
 /**
  * Exact SWAR 50/50 channel average of two ABGR Uint32Array framebuffers.
- * Preserves alpha=0xff with zero branching and zero bit-unpacking.
+ * Preserves alpha=0xff with zero bit-unpacking and returns true only if dst changed,
+ * avoiding redundant Canvas2D putImageData uploads on static Gigascreen frames.
  */
 export function blendFrames5050(
   srcA: Uint32Array,
   srcB: Uint32Array,
   dst: Uint32Array
-): void {
+): boolean {
   const len = dst.length;
+  let changed = false;
   for (let i = 0; i < len; i++) {
     const a = srcA[i];
     const b = srcB[i];
-    dst[i] = ((a & b) + (((a ^ b) & 0xfefefefe) >>> 1)) >>> 0;
+    const out = ((a & b) + (((a ^ b) & 0xfefefefe) >>> 1)) >>> 0;
+    if (dst[i] !== out) {
+      dst[i] = out;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/**
+ * Copies src into dst while detecting whether any pixel actually changed.
+ */
+export function copyFrameWithDiff(src: Uint32Array, dst: Uint32Array): boolean {
+  const len = dst.length;
+  let changed = false;
+  for (let i = 0; i < len; i++) {
+    const v = src[i];
+    if (dst[i] !== v) {
+      dst[i] = v;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+export const GIGASCREEN_BAND_COUNT = 8;
+
+/**
+ * Zero-allocation 8-band (256-sample total) FNV-1a signature across the 256x192 active area.
+ * Sampling both odd and even scanlines per 24px band catches scanline-interlaced and 48K-style
+ * Gigascreen even while animated sprites/scrollers mutate individual bands.
+ */
+export function computeActiveBandHashes(fb: Uint32Array, outBands: Uint32Array): void {
+  for (let band = 0; band < GIGASCREEN_BAND_COUNT; band++) {
+    let hash = 0x811c9dc5;
+    const bandTop = band * 24;
+    const rowA = (bandTop + 5 + BEAM_BORDER_Y) * BEAM_SCREEN_WIDTH + BEAM_BORDER_X;
+    const rowB = (bandTop + 16 + BEAM_BORDER_Y) * BEAM_SCREEN_WIDTH + BEAM_BORDER_X;
+    for (let x = 8; x < BEAM_ACTIVE_WIDTH; x += 16) {
+      hash = Math.imul(hash ^ fb[rowA + x], 0x01000193);
+      hash = Math.imul(hash ^ fb[rowB + x], 0x01000193);
+    }
+    outBands[band] = hash >>> 0;
   }
 }
 

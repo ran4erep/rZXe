@@ -492,6 +492,9 @@ export function addZxArtSearchHistory(
   const trimmed = query.trim();
   if (!trimmed) return [...history];
   const lower = trimmed.toLowerCase();
+  if (history.length > 0 && history[0].trim() === trimmed) {
+    return history as string[];
+  }
   const next = [trimmed];
   for (const item of history) {
     const clean = item.trim();
@@ -501,6 +504,98 @@ export function addZxArtSearchHistory(
   }
   saveZxArtSearchHistory(next);
   return next;
+}
+
+export const TOUCH_KEYBOARD_OPEN_DELTA_PX = 100;
+export const TOUCH_KEYBOARD_CLOSE_TOLERANCE_PX = 60;
+export const TOUCH_KEYBOARD_ORIENTATION_WIDTH_DELTA_PX = 80;
+
+export interface TouchKeyboardViewportState {
+  baselineWidth: number;
+  baselineHeight: number;
+  minKeyboardHeight: number;
+  keyboardOpen: boolean;
+}
+
+export function createTouchKeyboardViewportState(
+  width: number,
+  height: number
+): TouchKeyboardViewportState {
+  return {
+    baselineWidth: width,
+    baselineHeight: height,
+    minKeyboardHeight: height,
+    keyboardOpen: false,
+  };
+}
+
+/**
+ * Tracks visualViewport/window height changes while a touch-focused search input is active.
+ * Returns true only on the transition where an opened on-screen keyboard closes.
+ */
+export function evaluateTouchKeyboardResize(
+  state: TouchKeyboardViewportState,
+  width: number,
+  height: number
+): boolean {
+  if (width <= 0 || height <= 0) return false;
+
+  // Ignore orientation / horizontal layout resizes and re-anchor baseline
+  if (Math.abs(width - state.baselineWidth) > TOUCH_KEYBOARD_ORIENTATION_WIDTH_DELTA_PX) {
+    state.baselineWidth = width;
+    state.baselineHeight = height;
+    state.minKeyboardHeight = height;
+    state.keyboardOpen = false;
+    return false;
+  }
+
+  if (!state.keyboardOpen) {
+    if (height > state.baselineHeight) {
+      state.baselineHeight = height;
+      state.minKeyboardHeight = height;
+    } else if (state.baselineHeight - height >= TOUCH_KEYBOARD_OPEN_DELTA_PX) {
+      state.keyboardOpen = true;
+      state.minKeyboardHeight = height;
+    }
+    return false;
+  }
+
+  if (height < state.minKeyboardHeight) {
+    state.minKeyboardHeight = height;
+    return false;
+  }
+
+  const restoredNearBaseline = height >= state.baselineHeight - TOUCH_KEYBOARD_CLOSE_TOLERANCE_PX;
+  const roseEnough = height - state.minKeyboardHeight >= TOUCH_KEYBOARD_OPEN_DELTA_PX;
+  if (restoredNearBaseline || roseEnough) {
+    state.keyboardOpen = false;
+    if (height > state.baselineHeight) {
+      state.baselineHeight = height;
+    }
+    state.minKeyboardHeight = state.baselineHeight;
+    return true;
+  }
+
+  return false;
+}
+
+export interface SearchBlurCommitCheck {
+  query: string;
+  focusedViaTouch: boolean;
+  keyboardOpen: boolean;
+  suppressed: boolean;
+  alreadyCommitted: boolean;
+  windowLostFocus: boolean;
+}
+
+/**
+ * Returns true only when search input blur represents dismissing a touch keyboard.
+ * Desktop mouse/keyboard blurs never auto-commit unfinished queries.
+ */
+export function shouldCommitHistoryOnSearchBlur(check: SearchBlurCommitCheck): boolean {
+  if (check.alreadyCommitted || check.suppressed || check.windowLostFocus) return false;
+  if (check.query.trim().length === 0) return false;
+  return check.keyboardOpen || check.focusedViaTouch;
 }
 
 export function removeZxArtSearchHistoryItem(

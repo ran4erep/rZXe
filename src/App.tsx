@@ -307,7 +307,9 @@ export default function App() {
     speccy.soundEnabled = settings.soundEnabled;
     speccy.setFastTapeLoad(settings.fastTapeLoad);
     speccy.setCpuFreqMhz(settings.cpuFreqMhz);
-    speccy.setGigascreenMode(settings.gigascreenMode);
+    if (speccy.setGigascreenMode(settings.gigascreenMode)) {
+      paintFrameRef.current?.();
+    }
     speccy.keyboard.setJoystickMode(settings.joystickMode);
     beeper.setVolume(settings.volume);
     beeper.setMuted(!settings.soundEnabled || paused || anyModalOpen, !settings.soundEnabled);
@@ -322,8 +324,9 @@ export default function App() {
     const beeper = beeperRef.current!;
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext('2d', { alpha: false });
+    const ctx = canvas.getContext('2d', { alpha: false, willReadFrequently: true });
     if (!ctx) return;
+    ctx.imageSmoothingEnabled = false;
 
     const vp = getBorderViewport(settings.borderMode);
     const vpOffsetX = vp.offsetX;

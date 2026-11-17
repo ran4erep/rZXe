@@ -231,6 +231,143 @@ test('ZXSpectrum48 auto-Gigascreen blends alternating Bank 5/7 frames and settle
   assert.equal(settledPx, PALETTE_ABGR[12]);
 });
 
+test('blendFrames5050 & static Gigascreen return dirty=false when blended output is unchanged', () => {
+  const a = new Uint32Array([0xff0000ff, 0xffd70000]);
+  const b = new Uint32Array([0xff00ff00, 0xff00d7d7]);
+  const dst = new Uint32Array(2);
+
+  assert.equal(blendFrames5050(a, b, dst), true);
+  assert.equal(blendFrames5050(b, a, dst), false);
+
+  const speccy = new ZXSpectrum48('128k');
+  speccy.setGigascreenMode('auto');
+  speccy.cpu.iff1 = 0;
+  speccy.ramPages[5].fill(0x50, 0x1800, 0x1b00);
+  speccy.ramPages[7].fill(0x60, 0x1800, 0x1b00);
+
+  const dirtyHistory: boolean[] = [];
+  for (let i = 0; i < 8; i++) {
+    speccy.cpu.halted = false;
+    speccy.cpu.pc = 0x8000;
+    assembleIntoRam(speccy, 0x8000, [
+      0x3e, (i & 1) ? 0x08 : 0x00,
+      0x01, 0xfd, 0x7f,
+      0xed, 0x79,
+      0x76,
+    ]);
+    dirtyHistory.push(speccy.stepFrame(true));
+  }
+
+  // Once blended on frame 2, subsequent identical Bank 5/7 alternations must not spam putImageData
+  assert.equal(dirtyHistory[2], true);
+  assert.deepEqual(dirtyHistory.slice(3), [false, false, false, false, false]);
+});
+
+test('auto-Gigascreen 8-band detector stays locked on 48K Gigascreen with animated top band', () => {
+  const speccy = new ZXSpectrum48('48k');
+  speccy.setGigascreenMode('auto');
+  speccy.cpu.iff1 = 0;
+
+  const expectedBlend = new Uint32Array(1);
+  blendFrames5050(
+    new Uint32Array([PALETTE_ABGR[10]]),
+    new Uint32Array([PALETTE_ABGR[12]]),
+    expectedBlend
+  );
+
+  // Alternate full-screen 48K attributes (Red <-> Green) while animating row 0 every frame
+  for (let frame = 0; frame < 10; frame++) {
+    const baseAttr = (frame & 1) ? 0x60 : 0x50;
+    speccy.ramPages[5].fill(baseAttr, 0x1800, 0x1b00);
+    // Moving sprite mutating top band (row 0) uniquely on every frame
+    speccy.ramPages[5][0x1800 + (frame % 32)] = 0x78;
+    speccy.cpu.vramDirty = true;
+    speccy.cpu.halted = false;
+    speccy.cpu.pc = 0x8000;
+    assembleIntoRam(speccy, 0x8000, [0x76]);
+    speccy.stepFrame(true);
+  }
+
+  // Unanimated lower band must remain smoothly blended despite animated top band
+  const lowerPx =
+    speccy.frameBuffer[(BEAM_BORDER_Y + 120) * BEAM_SCREEN_WIDTH + BEAM_BORDER_X + 64];
+  assert.equal(lowerPx, expectedBlend[0]);
+});
+
+test('auto-Gigascreen recovers immediately after a single missed VSync flip', () => {
+  const speccy = new ZXSpectrum48('128k');
+  speccy.setGigascreenMode('auto');
+  speccy.cpu.iff1 = 0;
+  speccy.ramPages[5].fill(0x50, 0x1800, 0x1b00);
+  speccy.ramPages[7].fill(0x60, 0x1800, 0x1b00);
+
+  const expectedBlend = new Uint32Array(1);
+  blendFrames5050(
+    new Uint32Array([PALETTE_ABGR[10]]),
+    new Uint32Array([PALETTE_ABGR[12]]),
+    expectedBlend
+  );
+
+  // Lock into Gigascreen (5, 7, 5, 7)
+  for (const val of [0x00, 0x08, 0x00, 0x08]) {
+    speccy.cpu.halted = false;
+    speccy.cpu.pc = 0x8000;
+    assembleIntoRam(speccy, 0x8000, [0x3e, val, 0x01, 0xfd, 0x7f, 0xed, 0x79, 0x76]);
+    speccy.stepFrame(true);
+  }
+
+  // Miss 1 VSync (static Bank 7)
+  speccy.cpu.halted = false;
+  speccy.cpu.pc = 0x8000;
+  assembleIntoRam(speccy, 0x8000, [0x76]);
+  speccy.stepFrame(true);
+
+  // Resume flipping to Bank 5 on next frame -> must immediately blend (5 + 7) with zero extra flash
+  speccy.cpu.halted = false;
+  speccy.cpu.pc = 0x8000;
+  assembleIntoRam(speccy, 0x8000, [0x3e, 0x00, 0x01, 0xfd, 0x7f, 0xed, 0x79, 0x76]);
+  speccy.stepFrame(true);
+
+  const centerPx =
+    speccy.frameBuffer[(BEAM_BORDER_Y + 50) * BEAM_SCREEN_WIDTH + BEAM_BORDER_X + 50];
+  assert.equal(centerPx, expectedBlend[0]);
+});
+
+test('post-active-scan OUT 0x7FFD flushes the visible bank before switching for next frame', () => {
+  const speccy = new ZXSpectrum48('128k');
+  speccy.setGigascreenMode('off');
+  speccy.cpu.iff1 = 0;
+  speccy.ramPages[5].fill(0x10, 0x1800, 0x1b00); // Red
+  speccy.ramPages[7].fill(0x28, 0x1800, 0x1b00); // Cyan
+
+  // Wait ~60000T (past active scanline 191 end at 58140T on 128K), then switch to Bank 7
+  // 2310 * 26T = 60060T = 0x0906
+  speccy.cpu.pc = 0x8000;
+  assembleIntoRam(speccy, 0x8000, [
+    0x11, 0x06, 0x09,       // LD DE, 0x0906
+    0x1b, 0x7a, 0xb3, 0x20, 0xfb, // wait ~60060T
+    0x3e, 0x08,             // LD A, 8 (Bank 7)
+    0x01, 0xfd, 0x7f,       // LD BC, 0x7FFD
+    0xed, 0x79,             // OUT (C), A
+    0x76,                   // HALT
+  ]);
+
+  speccy.stepFrame(true);
+  const pxFrame1 =
+    speccy.frameBuffer[(BEAM_BORDER_Y + 96) * BEAM_SCREEN_WIDTH + BEAM_BORDER_X + 64];
+  // Frame 1 active scanlines must still show Bank 5 (Red)
+  assert.equal(pxFrame1, PALETTE_ABGR[2]);
+
+  // Frame 2 (no further writes) must automatically render Bank 7 (Cyan)
+  speccy.cpu.halted = false;
+  speccy.cpu.pc = 0x8000;
+  assembleIntoRam(speccy, 0x8000, [0x76]);
+  speccy.stepFrame(true);
+  const pxFrame2 =
+    speccy.frameBuffer[(BEAM_BORDER_Y + 96) * BEAM_SCREEN_WIDTH + BEAM_BORDER_X + 64];
+  assert.equal(pxFrame2, PALETTE_ABGR[5]);
+});
+
 test('sanitizeEmulatorSettings validates gigascreenMode safely', () => {
   assert.equal(sanitizeEmulatorSettings({}).gigascreenMode, 'auto');
   assert.equal(sanitizeEmulatorSettings({ gigascreenMode: 'on' }).gigascreenMode, 'on');

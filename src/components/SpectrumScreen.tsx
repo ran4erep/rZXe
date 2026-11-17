@@ -256,7 +256,7 @@ export const SpectrumScreen: React.FC<SpectrumScreenProps> = React.memo(({
             onPointerCancel={handleCanvasPointerCancel}
             onContextMenu={handleCanvasContextMenu}
             onWheel={handleCanvasWheel}
-            className="w-full h-full block pixelated [contain:layout_paint] cursor-crosshair"
+            className="w-full h-full block pixelated cursor-crosshair"
           />
 
           {scanlines && (
