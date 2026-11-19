@@ -19,6 +19,11 @@ import { shouldUnzipEntry } from './archiveExtractor';
 
 export const ZXART_DIRECT_API_BASE = 'https://zxart.ee/api';
 
+/**
+ * URL прокси-сервера (Vercel) для скачивания файлов с zxart.ee.
+ */
+export const DEFAULT_ZXART_PROXY_URL = 'https://rzxe-proxy.vercel.app';
+
 const ALLOWED_ORDERS = new Set<ZxArtSortOrder>(['votes,desc', 'year,desc', 'title,asc']);
 
 export interface ZxArtDirectGamesPage {
@@ -28,12 +33,6 @@ export interface ZxArtDirectGamesPage {
   nextStart: number;
   hasMore: boolean;
   games: ZxArtGameSummary[];
-}
-
-export interface ExternalCorsProxySpec {
-  id: string;
-  label: string;
-  buildUrl: (targetUrl: string) => string;
 }
 
 function encodeRawPathChars(url: string): string {
@@ -61,7 +60,7 @@ export function normalizeZxArtDownloadUrl(fileUrl: string): string {
 
 /**
  * Extracts canonical ID-only URL (e.g. `https://zxart.ee/releasefile/id:598761/`)
- * as a clean fallback when filenames contain special characters that strict proxies choke on.
+ * as a clean retry target if a release filename contains special characters.
  */
 export function buildCanonicalZxArtDownloadUrl(fileUrl: string): string | null {
   try {
@@ -78,40 +77,76 @@ export function buildCanonicalZxArtDownloadUrl(fileUrl: string): string | null {
   }
 }
 
-/**
- * Free, keyless, binary-safe public CORS proxies used automatically
- * when the app is deployed as pure static files without server.ts.
- */
-export const EXTERNAL_CORS_PROXIES: readonly ExternalCorsProxySpec[] = [
-  {
-    id: 'corsmirror',
-    label: 'corsmirror.com',
-    buildUrl: (targetUrl) =>
-      `https://corsmirror.com/v1?url=${encodeURIComponent(targetUrl)}`,
-  },
-  {
-    id: 'isteed',
-    label: 'cors.isteed.cc',
-    buildUrl: (targetUrl) => `https://cors.isteed.cc/${encodeRawPathChars(targetUrl)}`,
-  },
-  {
-    id: 'allorigins-hexlet',
-    label: 'allorigins.hexlet.app',
-    buildUrl: (targetUrl) =>
-      `https://allorigins.hexlet.app/raw?url=${encodeURIComponent(targetUrl)}`,
-  },
-  {
-    id: 'cors-eu-org',
-    label: 'cors.eu.org',
-    buildUrl: (targetUrl) => `https://cors.eu.org/${encodeRawPathChars(targetUrl)}`,
-  },
-  {
-    id: 'allorigins-raw',
-    label: 'api.allorigins.win',
-    buildUrl: (targetUrl) =>
-      `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
-  },
-];
+export function isAllowedZxArtApiUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'https:' && parsed.hostname === 'zxart.ee' && parsed.pathname.startsWith('/api/');
+  } catch {
+    return false;
+  }
+}
+
+export function normalizeZxArtProxyBaseUrl(raw: string | null | undefined): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      return null;
+    }
+    const cleanPath = parsed.pathname.replace(/\/+$/, '');
+    return `${parsed.origin}${cleanPath}`;
+  } catch {
+    return null;
+  }
+}
+
+let runtimeProxyUrlOverride: string | null | undefined;
+
+export function setZxArtProxyUrlForTests(url: string | null | undefined): void {
+  runtimeProxyUrlOverride = url;
+}
+
+export function clearZxArtDownloadCacheForTests(): void {
+  DOWNLOADED_FILE_CACHE.clear();
+}
+
+export function getConfiguredZxArtProxyUrl(): string | null {
+  if (runtimeProxyUrlOverride !== undefined) {
+    return normalizeZxArtProxyBaseUrl(runtimeProxyUrlOverride);
+  }
+  return normalizeZxArtProxyBaseUrl(DEFAULT_ZXART_PROXY_URL);
+}
+
+function buildProxyUrl(proxyBaseUrl: string, targetUrl: string): string | null {
+  const base = normalizeZxArtProxyBaseUrl(proxyBaseUrl);
+  if (!base) return null;
+  const normalizedTarget = normalizeZxArtDownloadUrl(targetUrl);
+  const endpoint = new URL(base);
+  endpoint.searchParams.set('url', normalizedTarget);
+  return endpoint.href;
+}
+
+export function buildZxArtProxyDownloadUrl(
+  targetUrl: string,
+  proxyBaseUrl: string | null = getConfiguredZxArtProxyUrl()
+): string | null {
+  if (!proxyBaseUrl || !isAllowedZxArtDownloadUrl(targetUrl)) {
+    return null;
+  }
+  return buildProxyUrl(proxyBaseUrl, targetUrl);
+}
+
+export function buildZxArtProxyApiUrl(
+  targetUrl: string,
+  proxyBaseUrl: string | null = getConfiguredZxArtProxyUrl()
+): string | null {
+  if (!proxyBaseUrl || !isAllowedZxArtApiUrl(targetUrl)) {
+    return null;
+  }
+  return buildProxyUrl(proxyBaseUrl, targetUrl);
+}
 
 export function buildZxArtDirectCategoriesUrl(): string {
   return `${ZXART_DIRECT_API_BASE}/action:filter/export:zxProdCategory/language:rus/start:0/limit:300/filter:zxProdCategoryAll/`;
@@ -280,7 +315,6 @@ export function isHtmlOrJsonErrorPayload(
 
   if (
     lowerHead.startsWith('{"error"') ||
-    lowerHead.startsWith('{"corsfix_error"') ||
     lowerHead.startsWith('{"message"') ||
     lowerHead.startsWith('{"status"') ||
     lowerHead.startsWith('rate limit') ||
@@ -292,118 +326,22 @@ export function isHtmlOrJsonErrorPayload(
   return false;
 }
 
-export function buildExternalProxyDownloadCandidates(
-  targetUrl: string,
-  preferredIndex = 0
-): Array<{ index: number; id: string; label: string; url: string }> {
-  if (!isAllowedZxArtDownloadUrl(targetUrl)) {
-    return [];
-  }
-
-  const normalizedUrl = normalizeZxArtDownloadUrl(targetUrl);
-  const count = EXTERNAL_CORS_PROXIES.length;
-  const start =
-    Number.isInteger(preferredIndex) && preferredIndex >= 0 && preferredIndex < count
-      ? preferredIndex
-      : 0;
-
-  const out: Array<{ index: number; id: string; label: string; url: string }> = [];
-  for (let offset = 0; offset < count; offset++) {
-    const index = (start + offset) % count;
-    const spec = EXTERNAL_CORS_PROXIES[index];
-    out.push({
-      index,
-      id: spec.id,
-      label: spec.label,
-      url: spec.buildUrl(normalizedUrl),
-    });
-  }
-  return out;
-}
-
 // ============================================================================
-// Runtime Browser Fetchers (Direct ZX-Art API + External CORS Proxies Only)
+// Runtime Browser Fetchers (Direct ZX-Art API + Vercel Proxy)
 // ============================================================================
-
-const PROXY_PREF_STORAGE_KEY = 'zxart_proxy_pref_v2';
-const RATE_LIMIT_COOLDOWN_MS = 60_000;
-const TRANSIENT_COOLDOWN_MS = 18_000;
-
-let preferredExternalProxyIndex = 0;
-let stateHydrated = false;
-const PROXY_COOLDOWN_UNTIL = new Map<string, number>();
 
 const DOWNLOADED_FILE_CACHE = new Map<string, Uint8Array>();
 const MAX_CACHED_DOWNLOAD_ENTRIES = 8;
 const MAX_CACHED_DOWNLOAD_ITEM_BYTES = 2 * 1024 * 1024;
 
-function getSafeLocalStorage(): Storage | null {
-  try {
-    if (typeof window !== 'undefined' && window.localStorage) {
-      return window.localStorage;
-    }
-  } catch {
-    // Ignore restricted storage access
-  }
-  return null;
-}
+const DIRECT_API_TIMEOUT_MS = 9_500;
+const PROXY_HEADER_TIMEOUT_MS = 12_000;
+const STREAM_STALL_TIMEOUT_MS = 15_000;
+const ZIP_SELECTIVE_RANGE_MIN_BYTES = 4 * 1024 * 1024;
+const ZIP_RANGE_COALESCE_GAP_BYTES = 64 * 1024;
+const ZIP_RANGE_MAX_SPAN_BYTES = 8 * 1024 * 1024;
 
-function hydrateProxyStateOnce(): void {
-  if (stateHydrated) return;
-  stateHydrated = true;
-
-  const ls = getSafeLocalStorage();
-  if (ls) {
-    try {
-      const savedId = ls.getItem(PROXY_PREF_STORAGE_KEY);
-      if (savedId) {
-        const idx = EXTERNAL_CORS_PROXIES.findIndex((p) => p.id === savedId);
-        if (idx >= 0) {
-          preferredExternalProxyIndex = idx;
-        }
-      }
-    } catch {
-      // Ignore storage read errors
-    }
-  }
-}
-
-function rememberPreferredProxy(index: number, id: string): void {
-  preferredExternalProxyIndex = index;
-  PROXY_COOLDOWN_UNTIL.delete(id);
-  const ls = getSafeLocalStorage();
-  if (ls) {
-    try {
-      ls.setItem(PROXY_PREF_STORAGE_KEY, id);
-    } catch {
-      // Ignore quota errors
-    }
-  }
-}
-
-function markProxyCooldown(id: string, status: number): void {
-  const duration =
-    status === 429 || status === 401 || status === 403
-      ? RATE_LIMIT_COOLDOWN_MS
-      : TRANSIENT_COOLDOWN_MS;
-  PROXY_COOLDOWN_UNTIL.set(id, Date.now() + duration);
-}
-
-export function resetProxyDiscoveryForTests(): void {
-  preferredExternalProxyIndex = 0;
-  stateHydrated = false;
-  PROXY_COOLDOWN_UNTIL.clear();
-  DOWNLOADED_FILE_CACHE.clear();
-
-  const ls = getSafeLocalStorage();
-  if (ls) {
-    try {
-      ls.removeItem(PROXY_PREF_STORAGE_KEY);
-    } catch {
-      // Ignore
-    }
-  }
-}
+const ZIP_UTF8_DECODER = new TextDecoder('utf-8', { fatal: false });
 
 function combineAbortSignals(
   parent: AbortSignal | undefined,
@@ -450,8 +388,6 @@ function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-const DIRECT_API_TIMEOUT_MS = 9_500;
-
 async function fetchJsonViaSingleAttempt(
   url: string,
   timeoutMs: number,
@@ -474,10 +410,9 @@ async function fetchJsonViaSingleAttempt(
 }
 
 async function fetchJsonDirect(url: string, signal?: AbortSignal): Promise<unknown> {
-  hydrateProxyStateOnce();
   let lastErr: unknown;
 
-  // Try direct CORS-enabled ZX-Art API (plus 1 quick retry on transient blips)
+  // Try direct CORS-enabled ZX-Art API first (lowest latency, saves proxy quota)
   for (let attempt = 0; attempt < 2; attempt++) {
     if (signal?.aborted) {
       throw new DOMException('Aborted', 'AbortError');
@@ -493,31 +428,20 @@ async function fetchJsonDirect(url: string, signal?: AbortSignal): Promise<unkno
     }
   }
 
-  // Last-resort JSON fallback through healthy external CORS proxies if direct zxart.ee fails
-  const now = Date.now();
-  const proxySpecs = selectOrderedProxyCandidates(
-    EXTERNAL_CORS_PROXIES.map((spec, index) => ({
-      index,
-      id: spec.id,
-      label: spec.label,
-      url: spec.buildUrl(url),
-    })),
-    now
-  );
-
-  for (let i = 0; i < Math.min(3, proxySpecs.length); i++) {
+  // Single fallback through the configured Vercel proxy if direct zxart.ee fails
+  const proxyApiUrl = buildZxArtProxyApiUrl(url);
+  if (proxyApiUrl) {
     if (signal?.aborted) {
       throw new DOMException('Aborted', 'AbortError');
     }
-    const spec = proxySpecs[i];
     try {
-      const json = await fetchJsonViaSingleAttempt(spec.url, 6_500, signal);
+      const json = await fetchJsonViaSingleAttempt(proxyApiUrl, DIRECT_API_TIMEOUT_MS, signal);
       if (json && typeof json === 'object' && 'responseData' in (json as Record<string, unknown>)) {
-        rememberPreferredProxy(spec.index, spec.id);
         return json;
       }
     } catch (err) {
       if (signal?.aborted) throw err;
+      lastErr = err;
     }
   }
 
@@ -691,39 +615,6 @@ export async function fetchZxArtReleasesSmart(
   return parseZxArtReleasesResponse(rawJson);
 }
 
-const EXTERNAL_PROXY_HEADER_TIMEOUT_MS = 12_000;
-const STREAM_STALL_TIMEOUT_MS = 15_000;
-const ZIP_SELECTIVE_RANGE_MIN_BYTES = 4 * 1024 * 1024;
-const ZIP_RANGE_COALESCE_GAP_BYTES = 64 * 1024;
-const ZIP_RANGE_MAX_SPAN_BYTES = 8 * 1024 * 1024;
-const HEDGE_STAGGER_MS = 700;
-const MAX_CONCURRENT_HEDGES = 3;
-
-const ZIP_UTF8_DECODER = new TextDecoder('utf-8', { fatal: false });
-
-function selectOrderedProxyCandidates<T extends { id: string }>(
-  candidates: readonly T[],
-  nowMs: number,
-  ignoreCooldowns = false
-): T[] {
-  if (ignoreCooldowns || PROXY_COOLDOWN_UNTIL.size === 0) {
-    return [...candidates];
-  }
-  const healthy: T[] = [];
-  const cooling: T[] = [];
-  for (let i = 0; i < candidates.length; i++) {
-    const item = candidates[i];
-    const until = PROXY_COOLDOWN_UNTIL.get(item.id) ?? 0;
-    if (until > nowMs) {
-      cooling.push(item);
-    } else {
-      if (until !== 0) PROXY_COOLDOWN_UNTIL.delete(item.id);
-      healthy.push(item);
-    }
-  }
-  return [...healthy, ...cooling];
-}
-
 function cacheDownloadedFile(fileUrl: string, bytes: Uint8Array): void {
   if (bytes.byteLength === 0 || bytes.byteLength > MAX_CACHED_DOWNLOAD_ITEM_BYTES) return;
   if (DOWNLOADED_FILE_CACHE.has(fileUrl)) {
@@ -756,10 +647,7 @@ class HtmlOrJsonProxyError extends Error {
 }
 
 class LargeZipRangeSwitchSignal extends Error {
-  constructor(
-    public readonly totalBytes: number,
-    public readonly firstChunk: Uint8Array
-  ) {
+  constructor(public readonly totalBytes: number) {
     super('Large ZIP detected for selective range fetch');
   }
 }
@@ -771,7 +659,6 @@ async function readResponseStreamWithWatchdog(
   options: {
     stallTimeoutMs: number;
     detectLargeZip: boolean;
-    onValidFirstChunk?: () => void;
   }
 ): Promise<Uint8Array> {
   const hasContentEncoding = Boolean(res.headers.get('content-encoding'));
@@ -786,7 +673,6 @@ async function readResponseStreamWithWatchdog(
     if (isHtmlOrJsonErrorPayload(buf, contentType)) {
       throw new HtmlOrJsonProxyError();
     }
-    options.onValidFirstChunk?.();
     return buf;
   }
 
@@ -845,9 +731,8 @@ async function readResponseStreamWithWatchdog(
           } catch {
             // Ignore cancel errors
           }
-          throw new LargeZipRangeSwitchSignal(expectedLen, value);
+          throw new LargeZipRangeSwitchSignal(expectedLen);
         }
-        options.onValidFirstChunk?.();
       }
 
       if (prealloc !== null) {
@@ -856,7 +741,6 @@ async function readResponseStreamWithWatchdog(
           totalRead += value.byteLength;
           continue;
         }
-        // Fallback if actual decompressed bytes exceed compressed Content-Length
         if (totalRead > 0) {
           chunks.push(prealloc.slice(0, totalRead));
         }
@@ -984,7 +868,6 @@ function parseZipCentralDirectory(
 
   if (pos !== cd.byteLength) return null;
 
-  // Sort a copy by lfhOffset so each entry gets its tight byte upper bound in the archive
   const byOffset = [...entries].sort((a, b) => a.lfhOffset - b.lfhOffset);
   for (let i = 0; i < byOffset.length; i++) {
     const cur = byOffset[i];
@@ -1028,13 +911,13 @@ function coalesceZipEntrySpans(kept: readonly ZipCdEntry[]): ByteSpanRequest[] {
 }
 
 async function fetchProxyByteRange(
-  candidate: { index: number; id: string; url: string },
+  proxyUrl: string,
   start: number,
   end: number,
   signal?: AbortSignal
-): Promise<{ status: number; bytes: Uint8Array | null }> {
+): Promise<Uint8Array | null> {
   const expectedLen = end - start + 1;
-  if (expectedLen <= 0) return { status: 0, bytes: null };
+  if (expectedLen <= 0) return null;
 
   const ctrl = new AbortController();
   const onParentAbort = () => ctrl.abort(signal?.reason);
@@ -1044,11 +927,11 @@ async function fetchProxyByteRange(
   }
   const headerTimer = globalThis.setTimeout(
     () => ctrl.abort(new Error('range header timeout')),
-    EXTERNAL_PROXY_HEADER_TIMEOUT_MS
+    PROXY_HEADER_TIMEOUT_MS
   );
 
   try {
-    const res = await fetch(candidate.url, {
+    const res = await fetch(proxyUrl, {
       signal: ctrl.signal,
       headers: { Range: `bytes=${start}-${end}` },
       referrerPolicy: 'no-referrer',
@@ -1062,10 +945,7 @@ async function fetchProxyByteRange(
       } catch {
         // Ignore cancel errors
       }
-      if (!res.ok) {
-        markProxyCooldown(candidate.id, res.status);
-      }
-      return { status: res.status, bytes: null };
+      return null;
     }
 
     const bytes = await readResponseStreamWithWatchdog(
@@ -1077,14 +957,10 @@ async function fetchProxyByteRange(
         detectLargeZip: false,
       }
     );
-    if (bytes.byteLength !== expectedLen) {
-      return { status: 206, bytes: null };
-    }
-    return { status: 206, bytes };
+    return bytes.byteLength === expectedLen ? bytes : null;
   } catch (err) {
     if (signal?.aborted) throw err;
-    markProxyCooldown(candidate.id, 0);
-    return { status: 0, bytes: null };
+    return null;
   } finally {
     globalThis.clearTimeout(headerTimer);
     if (signal) signal.removeEventListener('abort', onParentAbort);
@@ -1093,28 +969,15 @@ async function fetchProxyByteRange(
 
 async function tryDownloadSelectiveZipViaRange(
   totalBytes: number,
-  candidates: readonly { index: number; id: string; label: string; url: string }[],
+  proxyUrl: string,
   signal?: AbortSignal
 ): Promise<Uint8Array | null> {
-  if (totalBytes < 22 || candidates.length === 0) return null;
+  if (totalBytes < 22) return null;
 
-  // 1) Fetch tail 64KB to locate ZIP End-Of-Central-Directory (EOCD)
   const tailStart = Math.max(0, totalBytes - 65536);
   const tailEnd = totalBytes - 1;
-  let workingCandidate: { index: number; id: string; label: string; url: string } | null = null;
-  let tailBytes: Uint8Array | null = null;
-
-  for (let i = 0; i < candidates.length; i++) {
-    const cand = candidates[i];
-    const probe = await fetchProxyByteRange(cand, tailStart, tailEnd, signal);
-    if (probe.status === 206 && probe.bytes) {
-      workingCandidate = cand;
-      tailBytes = probe.bytes;
-      break;
-    }
-  }
-
-  if (!workingCandidate || !tailBytes) return null;
+  const tailBytes = await fetchProxyByteRange(proxyUrl, tailStart, tailEnd, signal);
+  if (!tailBytes) return null;
 
   const eocd = parseZipEocdFromTail(tailBytes);
   if (
@@ -1126,23 +989,6 @@ async function tryDownloadSelectiveZipViaRange(
     return null;
   }
 
-  // Helper that fetches a range preferring the verified Range-capable proxy, with backup fallback
-  const fetchRangeReliable = async (start: number, end: number): Promise<Uint8Array | null> => {
-    const primary = await fetchProxyByteRange(workingCandidate!, start, end, signal);
-    if (primary.status === 206 && primary.bytes) return primary.bytes;
-    for (let i = 0; i < candidates.length; i++) {
-      const cand = candidates[i];
-      if (cand.id === workingCandidate!.id) continue;
-      const alt = await fetchProxyByteRange(cand, start, end, signal);
-      if (alt.status === 206 && alt.bytes) {
-        workingCandidate = cand;
-        return alt.bytes;
-      }
-    }
-    return null;
-  };
-
-  // 2) Slice Central Directory from tailBytes if already covered, else fetch via Range
   let cdBytes: Uint8Array | null = null;
   if (eocd.cdOffset >= tailStart) {
     const rel = eocd.cdOffset - tailStart;
@@ -1151,11 +997,15 @@ async function tryDownloadSelectiveZipViaRange(
     }
   }
   if (!cdBytes) {
-    cdBytes = await fetchRangeReliable(eocd.cdOffset, eocd.cdOffset + eocd.cdSize - 1);
+    cdBytes = await fetchProxyByteRange(
+      proxyUrl,
+      eocd.cdOffset,
+      eocd.cdOffset + eocd.cdSize - 1,
+      signal
+    );
   }
   if (!cdBytes) return null;
 
-  // 3) Parse Central Directory & keep only playable ZX Spectrum / nested-archive entries
   const allEntries = parseZipCentralDirectory(cdBytes, eocd.cdOffset);
   if (!allEntries) return null;
 
@@ -1168,21 +1018,16 @@ async function tryDownloadSelectiveZipViaRange(
     keptTotalSpanBytes += Math.max(0, entry.lfhEndExclusive - entry.lfhOffset);
   }
 
-  // If ZIP contains zero playable entries, emit a 22-byte empty ZIP immediately
-  // instead of wasting bandwidth on unrelated PC binaries/media.
   if (keptEntries.length === 0) {
     const emptyEocd = new Uint8Array(22);
     new DataView(emptyEocd.buffer).setUint32(0, 0x06054b50, true);
-    rememberPreferredProxy(workingCandidate.index, workingCandidate.id);
     return emptyEocd;
   }
 
-  // If kept entries already make up >80% of the archive, a full sequential stream is cheaper
   if (keptTotalSpanBytes > totalBytes * 0.8) {
     return null;
   }
 
-  // 4) Download only the kept spans via coalesced Range requests
   const spans = coalesceZipEntrySpans(keptEntries);
   const localChunks: Uint8Array[] = [];
   const newOffsets: number[] = [];
@@ -1191,7 +1036,7 @@ async function tryDownloadSelectiveZipViaRange(
 
   for (let sIdx = 0; sIdx < spans.length; sIdx++) {
     const span = spans[sIdx];
-    const spanBytes = await fetchRangeReliable(span.start, span.end);
+    const spanBytes = await fetchProxyByteRange(proxyUrl, span.start, span.end, signal);
     if (!spanBytes) return null;
 
     for (let eIdx = 0; eIdx < span.entries.length; eIdx++) {
@@ -1206,7 +1051,6 @@ async function tryDownloadSelectiveZipViaRange(
       const localRecordLen = 30 + lfhNameLen + lfhExtraLen + entry.compSize;
       if (rel + localRecordLen > spanBytes.byteLength) return null;
 
-      // Copy local record so we can normalize Data Descriptor bits cleanly if needed
       const localRecord = spanBytes.slice(rel, rel + localRecordLen);
       if ((entry.flags & 0x0008) !== 0) {
         const recDv = new DataView(localRecord.buffer, localRecord.byteOffset, 30);
@@ -1223,7 +1067,6 @@ async function tryDownloadSelectiveZipViaRange(
     }
   }
 
-  // 5) Reassemble compact valid ZIP containing exclusively the kept Spectrum entries
   const out = new Uint8Array(totalLocalBytes + totalCdBytes + 22);
   let writePos = 0;
   for (let i = 0; i < localChunks.length; i++) {
@@ -1257,253 +1100,85 @@ async function tryDownloadSelectiveZipViaRange(
   eocdDv.setUint32(16, cdOutStart, true);
   eocdDv.setUint16(20, 0, true);
 
-  rememberPreferredProxy(workingCandidate.index, workingCandidate.id);
   return out;
 }
 
-interface HedgeWaveResult {
+interface ProxyDownloadAttempt {
   bytes: Uint8Array | null;
-  lastStatus: number;
-  fallbackToFullStream?: boolean;
+  status: number;
 }
 
-/**
- * Races external CORS proxies with staggered hedging:
- * - starts the healthiest proxy first (zero redundant bandwidth when responsive)
- * - aborts competing idle/slower full-GET streams once one proxy begins streaming valid bytes
- * - uses header + per-chunk stall watchdog so multi-megabyte files never fail mid-transfer
- * - switches large (>4MB) ZIP files to HTTP Range selective entry retrieval when supported
- */
-async function downloadViaHedgedProxyWave(
-  targetUrl: string,
-  ignoreCooldowns: boolean,
-  skipSelectiveZip: boolean,
+async function downloadBinaryFromProxy(
+  proxyUrl: string,
+  detectLargeZip: boolean,
   signal?: AbortSignal
-): Promise<HedgeWaveResult> {
-  const rawCandidates = buildExternalProxyDownloadCandidates(targetUrl, preferredExternalProxyIndex);
-  const queue = selectOrderedProxyCandidates(rawCandidates, Date.now(), ignoreCooldowns);
-  if (queue.length === 0) {
-    return { bytes: null, lastStatus: 0 };
+): Promise<ProxyDownloadAttempt> {
+  const ctrl = new AbortController();
+  const onParentAbort = () => ctrl.abort(signal?.reason);
+  if (signal) {
+    if (signal.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+    signal.addEventListener('abort', onParentAbort, { once: true });
   }
 
-  return new Promise<HedgeWaveResult>((resolve, reject) => {
-    let nextQueueIdx = 0;
-    let inFlight = 0;
-    let settled = false;
-    let lastStatus = 0;
-    let selectiveZipAttempted = skipSelectiveZip;
-    let activeStreamWinner: AbortController | null = null;
-    let hedgeTimer: ReturnType<typeof setTimeout> | null = null;
-    const activeControllers = new Set<AbortController>();
+  const headerTimer = globalThis.setTimeout(
+    () => ctrl.abort(new Error('proxy header timeout')),
+    PROXY_HEADER_TIMEOUT_MS
+  );
 
-    const clearHedgeTimer = () => {
-      if (hedgeTimer !== null) {
-        globalThis.clearTimeout(hedgeTimer);
-        hedgeTimer = null;
-      }
-    };
+  try {
+    const res = await fetch(proxyUrl, {
+      signal: ctrl.signal,
+      referrerPolicy: 'no-referrer',
+      credentials: 'omit',
+    });
+    globalThis.clearTimeout(headerTimer);
 
-    const cleanupAll = () => {
-      clearHedgeTimer();
-      if (signal) {
-        signal.removeEventListener('abort', onParentAbort);
+    if (!res.ok) {
+      try {
+        await res.body?.cancel();
+      } catch {
+        // Ignore cancel errors
       }
-      for (const ctrl of activeControllers) {
-        ctrl.abort();
-      }
-      activeControllers.clear();
-    };
-
-    const onParentAbort = () => {
-      if (settled) return;
-      settled = true;
-      cleanupAll();
-      reject(new DOMException('Aborted', 'AbortError'));
-    };
-
-    if (signal) {
-      if (signal.aborted) {
-        reject(new DOMException('Aborted', 'AbortError'));
-        return;
-      }
-      signal.addEventListener('abort', onParentAbort, { once: true });
+      return { bytes: null, status: res.status };
     }
 
-    const scheduleHedge = () => {
-      clearHedgeTimer();
-      if (
-        settled ||
-        activeStreamWinner !== null ||
-        nextQueueIdx >= queue.length ||
-        inFlight >= MAX_CONCURRENT_HEDGES
-      ) {
-        return;
+    const contentType = res.headers.get('content-type');
+    if (
+      contentType &&
+      (contentType.toLowerCase().includes('text/html') || isJsonContentType(contentType))
+    ) {
+      try {
+        await res.body?.cancel();
+      } catch {
+        // Ignore cancel errors
       }
-      hedgeTimer = globalThis.setTimeout(() => {
-        hedgeTimer = null;
-        if (
-          !settled &&
-          activeStreamWinner === null &&
-          nextQueueIdx < queue.length &&
-          inFlight < MAX_CONCURRENT_HEDGES
-        ) {
-          launchNext();
-        }
-      }, HEDGE_STAGGER_MS);
-    };
+      return { bytes: null, status: 502 };
+    }
 
-    const checkExhausted = () => {
-      if (!settled && inFlight === 0 && nextQueueIdx >= queue.length) {
-        settled = true;
-        cleanupAll();
-        resolve({ bytes: null, lastStatus });
+    const bytes = await readResponseStreamWithWatchdog(res, ctrl, contentType, {
+      stallTimeoutMs: STREAM_STALL_TIMEOUT_MS,
+      detectLargeZip,
+    });
+    return { bytes, status: res.status };
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    if (err instanceof LargeZipRangeSwitchSignal) {
+      const selective = await tryDownloadSelectiveZipViaRange(err.totalBytes, proxyUrl, signal);
+      if (selective) {
+        return { bytes: selective, status: 206 };
       }
-    };
-
-    const claimStreamWinner = (winnerCtrl: AbortController) => {
-      if (settled || activeStreamWinner !== null) return;
-      activeStreamWinner = winnerCtrl;
-      clearHedgeTimer();
-      for (const other of activeControllers) {
-        if (other !== winnerCtrl) {
-          other.abort();
-        }
-      }
-    };
-
-    const launchNext = () => {
-      if (settled || nextQueueIdx >= queue.length) return;
-      const candidate = queue[nextQueueIdx++];
-      inFlight++;
-
-      const ctrl = new AbortController();
-      activeControllers.add(ctrl);
-      let headerTimeoutId: ReturnType<typeof setTimeout> | null = globalThis.setTimeout(
-        () => ctrl.abort(new Error('header timeout')),
-        EXTERNAL_PROXY_HEADER_TIMEOUT_MS
-      );
-
-      scheduleHedge();
-
-      (async () => {
-        try {
-          const res = await fetch(candidate.url, {
-            signal: ctrl.signal,
-            referrerPolicy: 'no-referrer',
-            credentials: 'omit',
-          });
-          if (headerTimeoutId !== null) {
-            globalThis.clearTimeout(headerTimeoutId);
-            headerTimeoutId = null;
-          }
-
-          if (!res.ok) {
-            lastStatus = res.status;
-            markProxyCooldown(candidate.id, res.status);
-            return;
-          }
-
-          const ct = res.headers.get('content-type');
-          if (
-            ct &&
-            (ct.toLowerCase().includes('text/html') ||
-              ct.toLowerCase().includes('application/xhtml') ||
-              ct.toLowerCase().includes('application/json'))
-          ) {
-            try {
-              await res.body?.cancel();
-            } catch {
-              // Ignore
-            }
-            markProxyCooldown(candidate.id, 502);
-            return;
-          }
-
-          const buf = await readResponseStreamWithWatchdog(res, ctrl, ct, {
-            stallTimeoutMs: STREAM_STALL_TIMEOUT_MS,
-            detectLargeZip: !selectiveZipAttempted,
-            onValidFirstChunk: () => claimStreamWinner(ctrl),
-          });
-
-          if (!settled) {
-            settled = true;
-            rememberPreferredProxy(candidate.index, candidate.id);
-            cleanupAll();
-            resolve({ bytes: buf, lastStatus: 200 });
-          }
-        } catch (err) {
-          if (err instanceof LargeZipRangeSwitchSignal && !selectiveZipAttempted && !settled) {
-            selectiveZipAttempted = true;
-            settled = true;
-            cleanupAll();
-            try {
-              const rangeCandidates = [
-                candidate,
-                ...queue.filter((item) => item.id !== candidate.id),
-              ];
-              const compactZip = await tryDownloadSelectiveZipViaRange(
-                err.totalBytes,
-                rangeCandidates,
-                signal
-              );
-              if (compactZip) {
-                resolve({ bytes: compactZip, lastStatus: 200 });
-              } else {
-                resolve({ bytes: null, lastStatus: 0, fallbackToFullStream: true });
-              }
-            } catch (rangeErr) {
-              if (signal?.aborted) {
-                reject(rangeErr);
-              } else {
-                resolve({ bytes: null, lastStatus: 0, fallbackToFullStream: true });
-              }
-            }
-            return;
-          }
-
-          if (err instanceof HtmlOrJsonProxyError) {
-            if (!settled && !signal?.aborted) {
-              markProxyCooldown(candidate.id, 502);
-            }
-            return;
-          }
-
-          if (!settled && !signal?.aborted && !ctrl.signal.aborted) {
-            markProxyCooldown(candidate.id, 0);
-          } else if (
-            !settled &&
-            !signal?.aborted &&
-            ctrl.signal.aborted &&
-            activeStreamWinner === ctrl
-          ) {
-            // Stream stalled mid-transfer after winning -> cool down & let backup try
-            markProxyCooldown(candidate.id, 0);
-          }
-        } finally {
-          if (headerTimeoutId !== null) {
-            globalThis.clearTimeout(headerTimeoutId);
-            headerTimeoutId = null;
-          }
-          if (activeStreamWinner === ctrl) {
-            activeStreamWinner = null;
-          }
-          activeControllers.delete(ctrl);
-          inFlight--;
-          if (!settled) {
-            if (nextQueueIdx < queue.length && inFlight === 0) {
-              launchNext();
-            } else if (nextQueueIdx < queue.length && activeStreamWinner === null) {
-              scheduleHedge();
-            } else {
-              checkExhausted();
-            }
-          }
-        }
-      })();
-    };
-
-    launchNext();
-  });
+      return downloadBinaryFromProxy(proxyUrl, false, signal);
+    }
+    if (err instanceof HtmlOrJsonProxyError) {
+      return { bytes: null, status: 502 };
+    }
+    return { bytes: null, status: 0 };
+  } finally {
+    globalThis.clearTimeout(headerTimer);
+    if (signal) signal.removeEventListener('abort', onParentAbort);
+  }
 }
 
 export async function downloadZxArtFileSmart(
@@ -1514,48 +1189,56 @@ export async function downloadZxArtFileSmart(
     throw new Error('Недопустимый URL файла ZX-Art');
   }
 
-  hydrateProxyStateOnce();
-
   const cached = DOWNLOADED_FILE_CACHE.get(fileUrl);
   if (cached) {
-    // Refresh LRU order
     DOWNLOADED_FILE_CACHE.delete(fileUrl);
     DOWNLOADED_FILE_CACHE.set(fileUrl, cached);
     return cached;
   }
 
-  const normalizedUrl = normalizeZxArtDownloadUrl(fileUrl);
-
-  // Download strictly via external CORS proxies (identical on AI Studio and static sites)
-  let wave1 = await downloadViaHedgedProxyWave(normalizedUrl, false, false, signal);
-  if (wave1.fallbackToFullStream) {
-    wave1 = await downloadViaHedgedProxyWave(normalizedUrl, false, true, signal);
-  }
-  if (wave1.bytes) {
-    cacheDownloadedFile(fileUrl, wave1.bytes);
-    return wave1.bytes;
-  }
-
-  // Brief backoff before Wave 2 (tries canonical id:<id>/ URL if filename has special chars, or retries all proxies)
-  await sleepAbortable(350, signal);
-  const canonicalUrl = buildCanonicalZxArtDownloadUrl(normalizedUrl);
-  const targetWave2 = canonicalUrl ?? normalizedUrl;
-  let wave2 = await downloadViaHedgedProxyWave(targetWave2, true, false, signal);
-  if (wave2.fallbackToFullStream) {
-    wave2 = await downloadViaHedgedProxyWave(targetWave2, true, true, signal);
-  }
-  if (wave2.bytes) {
-    cacheDownloadedFile(fileUrl, wave2.bytes);
-    return wave2.bytes;
-  }
-
-  const finalStatus = wave2.lastStatus || wave1.lastStatus;
-  if (finalStatus === 429) {
+  const proxyBaseUrl = getConfiguredZxArtProxyUrl();
+  if (!proxyBaseUrl) {
     throw new Error(
-      'Бесплатные публичные CORS-прокси временно ограничили частоту запросов (HTTP 429). Нажмите «Скачать» или попробуйте через минуту.'
+      'Прокси-сервер для скачивания не настроен. Вы можете нажать «Скачать» и открыть файл с диска.'
+    );
+  }
+
+  const normalizedUrl = normalizeZxArtDownloadUrl(fileUrl);
+  const primaryProxyUrl = buildZxArtProxyDownloadUrl(normalizedUrl, proxyBaseUrl);
+  if (!primaryProxyUrl) {
+    throw new Error('Некорректный URL прокси-сервера');
+  }
+
+  const first = await downloadBinaryFromProxy(primaryProxyUrl, true, signal);
+  if (first.bytes) {
+    cacheDownloadedFile(fileUrl, first.bytes);
+    return first.bytes;
+  }
+
+  // Single fallback to canonical /releasefile/id:XXXXX/ URL if filename has special characters
+  const canonicalUrl = buildCanonicalZxArtDownloadUrl(normalizedUrl);
+  if (canonicalUrl) {
+    const canonicalProxyUrl = buildZxArtProxyDownloadUrl(canonicalUrl, proxyBaseUrl);
+    if (canonicalProxyUrl) {
+      const retry = await downloadBinaryFromProxy(canonicalProxyUrl, true, signal);
+      if (retry.bytes) {
+        cacheDownloadedFile(fileUrl, retry.bytes);
+        return retry.bytes;
+      }
+      if (retry.status > 0) {
+        throw new Error(
+          `Ошибка загрузки файла через прокси (HTTP ${retry.status}). Вы можете нажать «Скачать» и открыть файл с диска.`
+        );
+      }
+    }
+  }
+
+  if (first.status > 0) {
+    throw new Error(
+      `Ошибка загрузки файла через прокси (HTTP ${first.status}). Вы можете нажать «Скачать» и открыть файл с диска.`
     );
   }
   throw new Error(
-    'Не удалось скачать файл через внешние CORS-прокси. Вы можете нажать «Скачать» для прямой загрузки и открыть файл с диска.'
+    'Не удалось скачать файл через прокси-сервер. Вы можете нажать «Скачать» и открыть файл с диска.'
   );
 }
